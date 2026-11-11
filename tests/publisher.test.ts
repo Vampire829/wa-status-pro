@@ -43,6 +43,7 @@ test('публикация режется на пачки и уважает ис
       isReady: () => true,
       isBlocked: () => false,
       ownJid: () => '79990000000@s.whatsapp.net',
+      async deleteStatus() { return undefined },
       async sendStatus(_id, content, jids) {
         assert.equal(content.kind, 'text')
         calls.push(jids)
@@ -88,6 +89,7 @@ test('обрыв связи возвращает публикацию в оче�
       isReady: () => true,
       isBlocked: () => false,
       ownJid: () => '79990000000@s.whatsapp.net',
+      async deleteStatus() { return undefined },
       async sendStatus() {
         throw new WaSendError('Номер не подключён', { pause: true })
       },

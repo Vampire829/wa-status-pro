@@ -300,6 +300,18 @@ export class WaManager {
     }
   }
 
+  async deleteStatus(accountId: string, messageId: string, jids: string[]): Promise<void> {
+    const session = this.sessions.get(accountId)
+    if (!session?.sock || session.state !== 'connected') {
+      throw new WaSendError('Номер не подключён', { pause: true })
+    }
+    const own = this.ownJid(accountId)
+    const statusJidList = own && !jids.includes(own) ? [own, ...jids] : jids
+    await session.sock.sendMessage('status@broadcast', {
+      delete: { remoteJid: 'status@broadcast', fromMe: true, id: messageId },
+    }, { statusJidList, broadcast: true })
+  }
+
   async shutdown(): Promise<void> {
     for (const [accountId, session] of this.sessions) {
       session.suppressReconnect = true

@@ -111,6 +111,7 @@ export function renderFlash(query: Record<string, unknown>): string {
     saved: ['ok', 'Сохранено.'],
     deleted: ['ok', 'Удалено.'],
     queued: ['ok', 'Публикация поставлена в очередь.'],
+    delete_queued: ['ok', 'Удаление поставлено в очередь. У тех, кому статус ещё не истёк, он пропадёт.'],
     scheduled: ['ok', 'Публикация запланирована по московскому времени.'],
     cancelled: ['ok', 'Публикация остановлена.'],
     bad_password: ['bad', 'Неверный пароль.'],
@@ -410,7 +411,7 @@ export function statusListPage(posts: StatusPost[], accounts: Map<string, Accoun
     <td>${esc(KIND_RU[post.kind])}</td>
     <td>${esc(AUDIENCE_RU[post.audienceSource])}${post.audienceTag ? `, ${esc(post.audienceTag)}` : ''}</td>
     <td>${post.successRecipients}/${post.totalRecipients}</td>
-    <td>${badge(post.status, POST_STATUS_RU[post.status])}</td>
+    <td>${post.deletedAt ? badge('cancelled', 'Удалён') : badge(post.status, POST_STATUS_RU[post.status])}</td>
     <td>${esc(formatMoscow(post.scheduledAt || post.createdAt))}</td>
   </tr>`).join('')
   return `<h1>Публикации</h1>
@@ -427,7 +428,8 @@ export function statusDetailPage(post: StatusPost, account: Account | null, batc
     <td>${batch.batchIndex + 1}</td>
     <td>${batch.recipientCount}</td>
     <td>${badge(batch.status, BATCH_STATUS_RU[batch.status])}</td>
-    <td>${esc(batch.error || '')}</td>
+    <td>${esc(batch.revokeStatus === 'revoked' ? 'отозван' : batch.revokeStatus === 'failed' ? 'не отозван' : batch.revokeStatus === 'pending' ? 'отзыв в очереди' : '')}</td>
+    <td>${esc(batch.revokeError || batch.error || '')}</td>
     <td>${esc(formatMoscow(batch.sentAt))}</td>
   </tr>`).join('')
   const cancel = post.status === 'queued' || post.status === 'scheduled' || post.status === 'running'
@@ -454,9 +456,12 @@ export function statusDetailPage(post: StatusPost, account: Account | null, batc
     ${post.body ? `<p>Текст: ${esc(post.body)}</p>` : ''}
     ${post.caption ? `<p>Подпись: ${esc(post.caption)}</p>` : ''}
     ${post.originalName ? `<p>Файл: ${esc(post.originalName)}</p>` : ''}
-    <p class="row">${cancel}${retry}</p>
+    <p class="row">${cancel}${retry}
+      ${post.deletedAt ? '' : `<form method="post" action="/status/${post.id}/delete" data-confirm="Удалить этот статус у всех в WhatsApp? Это нельзя отменить."><input type="hidden" name="csrf" value="${esc(csrf)}"><button class="danger" type="submit">Удалить</button></form>`}
+      ${post.deletedAt && batches.some((batch) => batch.revokeStatus === 'failed') ? `<form method="post" action="/status/${post.id}/revoke-retry"><input type="hidden" name="csrf" value="${esc(csrf)}"><button type="submit">Повторить удаление</button></form>` : ''}
+    </p>
   </div>
-  ${rows ? `<div class="panel"><table><tr><th>Пачка</th><th>Номеров</th><th>Статус</th><th>Ошибка</th><th>Время</th></tr>${rows}</table></div>` : ''}`
+  ${rows ? `<div class="panel"><table><tr><th>Пачка</th><th>Номеров</th><th>Отправка</th><th>Отзыв</th><th>Ошибка</th><th>Время</th></tr>${rows}</table></div>` : ''}`
 }
 
 export function storiesPage(input: {
@@ -467,16 +472,25 @@ export function storiesPage(input: {
   csrf: string
   batchSize: number
   batchDelayMs: number
+  showDeleted: boolean
+  failedRevokes: Map<number, boolean>
 }): string {
   const cards = input.posts.map((post) => {
     const expires = statusExpiresAt(post.finishedAt || post.createdAt)
     const live = expires ? new Date(expires).getTime() > Date.now() : false
     const initial = (input.accounts.get(post.accountId)?.label || 'WA').slice(0, 1)
     const thumb = post.thumbPath ? `/media/${post.id}/thumb` : ''
-    return `<button type="button" class="story-ring ${live ? '' : 'expired'}" data-open-story="${post.id}">
-      <span class="ring-face">${thumb ? `<img src="${esc(thumb)}" alt="">` : esc(initial)}</span>
-      <small>${esc(formatMoscow(post.finishedAt || post.createdAt))}</small>
-    </button>`
+    return `<div class="story-item ${post.deletedAt ? 'deleted' : ''}">
+      <button type="button" class="story-ring ${live ? '' : 'expired'}" data-open-story="${post.id}">
+        <span class="ring-face">${thumb ? `<img src="${esc(thumb)}" alt="">` : esc(initial)}</span>
+        <small>${post.deletedAt ? 'Удалён' : esc(formatMoscow(post.finishedAt || post.createdAt))}</small>
+      </button>
+      ${post.deletedAt
+        ? (input.failedRevokes.get(post.id)
+          ? `<form id="delete-story-${post.id}" method="post" action="/status/${post.id}/revoke-retry" data-confirm="Повторить отзыв этого статуса в WhatsApp?"><input type="hidden" name="csrf" value="${esc(input.csrf)}"><button class="ghost" type="submit">Повторить</button></form>`
+          : '')
+        : `<form id="delete-story-${post.id}" method="post" action="/status/${post.id}/delete" data-confirm="Удалить этот статус у всех в WhatsApp? Это нельзя отменить."><input type="hidden" name="csrf" value="${esc(input.csrf)}"><button class="ghost" type="submit">Удалить</button></form>`}
+    </div>`
   }).join('')
   const data = input.posts.map((post) => ({
     id: post.id,
@@ -489,9 +503,14 @@ export function storiesPage(input: {
     expires: statusExpiresAt(post.finishedAt || post.createdAt),
     views: input.views.get(post.id) ?? 0,
     label: input.accounts.get(post.accountId)?.label || 'Номер',
+    deleted: Boolean(post.deletedAt),
   }))
+  const toggle = input.showDeleted
+    ? '<a class="btn ghost" href="/stories">Скрыть удалённые</a>'
+    : '<a class="btn ghost" href="/stories?deleted=1">Показать удалённые</a>'
   return `<h1>Мои статусы</h1>
-  <p class="lead">Лента как в WhatsApp: кольцо, полноэкранный просмотр и сколько человек открыли статус. На вашем телефоне статус виден, потому что ваш номер есть в каждом списке зрителей.</p>
+  <p class="lead">Лента как в WhatsApp: кольцо, полноэкранный просмотр и сколько человек открыли статус. Удаление отзывает статус у всех, кому он ещё не истёк.</p>
+  <p>${toggle}</p>
   <div class="story-row">${cards || '<p>Опубликованных статусов пока нет.</p>'}</div>
   <div id="story-stage" class="story-stage hidden" hidden>
     <button type="button" class="story-close" id="story-close">Закрыть</button>

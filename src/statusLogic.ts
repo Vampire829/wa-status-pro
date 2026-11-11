@@ -92,6 +92,10 @@ export function viewFromReceipt(input: ReceiptInput, nowMs = Date.now()): { mess
   return { messageId, viewerJid, viewedAt }
 }
 
+export function statusDeleteKey(messageId: string): { remoteJid: 'status@broadcast'; fromMe: true; id: string } {
+  return { remoteJid: 'status@broadcast', fromMe: true, id: messageId }
+}
+
 function positiveSeconds(value: number | null | undefined): number | null {
   if (value == null || !Number.isFinite(value) || value <= 0) return null
   return value

@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import path from 'node:path'
 
 import { loadConfig } from './config.js'
@@ -39,6 +40,16 @@ const scheduler = startScheduler({
   batchDelayMs: config.batchDelayMs,
   minPublishIntervalMs: config.minPublishIntervalMs,
   log,
+  removeMedia(post) {
+    for (const file of [post.mediaPath, post.thumbPath]) {
+      if (!file) continue
+      const root = path.resolve(config.dataDir)
+      const resolved = path.resolve(file)
+      if (!resolved.startsWith(`${root}${path.sep}`)) continue
+      fs.rmSync(resolved, { force: true })
+    }
+    db.updatePost(post.id, { mediaPath: null, thumbPath: null })
+  },
 })
 
 let closing = false

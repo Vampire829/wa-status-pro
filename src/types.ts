@@ -86,6 +86,7 @@ export type StatusPost = {
   createdAt: string
   startedAt: string | null
   finishedAt: string | null
+  deletedAt: string | null
 }
 
 export type StatusBatch = {
@@ -98,6 +99,8 @@ export type StatusBatch = {
   error: string | null
   waMessageId: string | null
   sentAt: string | null
+  revokeStatus: 'pending' | 'revoked' | 'failed' | null
+  revokeError: string | null
 }
 
 export type ImportIssue = {

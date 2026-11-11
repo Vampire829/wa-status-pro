@@ -1,0 +1,6 @@
+# Подставьте свой домен. Caddy сам получит сертификат Let's Encrypt.
+# Контейнер Caddy должен быть в одной сети с сервисом app.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy app:8080
+}

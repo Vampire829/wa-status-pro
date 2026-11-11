@@ -42,6 +42,7 @@ test('публикация режется на пачки и уважает ис
     wa: {
       isReady: () => true,
       isBlocked: () => false,
+      ownJid: () => '79990000000@s.whatsapp.net',
       async sendStatus(_id, content, jids) {
         assert.equal(content.kind, 'text')
         calls.push(jids)
@@ -59,7 +60,7 @@ test('публикация режется на пачки и уважает ис
   assert.equal(saved?.totalRecipients, 3)
   assert.equal(saved?.successRecipients, 3)
   assert.equal(calls.length, 3)
-  assert.deepEqual(calls[0], ['79280000001@s.whatsapp.net', '79280000002@s.whatsapp.net'])
+  assert.deepEqual(calls[0], ['79990000000@s.whatsapp.net', '79280000001@s.whatsapp.net', '79280000002@s.whatsapp.net'])
   db.close()
 })
 
@@ -86,6 +87,7 @@ test('обрыв связи возвращает публикацию в оче�
     wa: {
       isReady: () => true,
       isBlocked: () => false,
+      ownJid: () => '79990000000@s.whatsapp.net',
       async sendStatus() {
         throw new WaSendError('Номер не подключён', { pause: true })
       },

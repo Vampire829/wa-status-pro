@@ -17,6 +17,7 @@ import type {
   SourceFilter,
   StatusBatch,
   StatusPost,
+  StatusView,
 } from './types.js'
 import { nowIso } from './time.js'
 
@@ -27,6 +28,9 @@ type PostPatch = Partial<{
   error: string | null
   startedAt: string | null
   finishedAt: string | null
+  thumbPath: string | null
+  mediaWidth: number | null
+  mediaHeight: number | null
   totalRecipients: number
   totalBatches: number
   sentBatches: number
@@ -255,6 +259,9 @@ export class AppDb {
     body: string
     caption: string
     mediaPath: string | null
+    thumbPath?: string | null
+    mediaWidth?: number | null
+    mediaHeight?: number | null
     originalName: string | null
     backgroundColor: string | null
     font: number | null
@@ -266,15 +273,18 @@ export class AppDb {
     const now = nowIso()
     const info = this.raw.prepare(
       `INSERT INTO status_posts (
-        account_id, kind, body, caption, media_path, original_name, background_color, font,
+        account_id, kind, body, caption, media_path, thumb_path, media_width, media_height, original_name, background_color, font,
         audience_source, audience_tag, scheduled_at, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.accountId,
       input.kind,
       input.body,
       input.caption,
       input.mediaPath,
+      input.thumbPath ?? null,
+      input.mediaWidth ?? null,
+      input.mediaHeight ?? null,
       input.originalName,
       input.backgroundColor,
       input.font,
@@ -321,6 +331,7 @@ export class AppDb {
     this.raw.prepare(
       `UPDATE status_posts SET
         status = ?, not_before = ?, error = ?, started_at = ?, finished_at = ?,
+        thumb_path = ?, media_width = ?, media_height = ?,
         total_recipients = ?, total_batches = ?, sent_batches = ?, success_recipients = ?, failed_recipients = ?
        WHERE id = ?`,
     ).run(
@@ -329,6 +340,9 @@ export class AppDb {
       next.error,
       next.startedAt,
       next.finishedAt,
+      next.thumbPath,
+      next.mediaWidth,
+      next.mediaHeight,
       next.totalRecipients,
       next.totalBatches,
       next.sentBatches,
@@ -350,14 +364,77 @@ export class AppDb {
     return row ? mapBatch(row) : null
   }
 
-  insertBatches(postId: number, chunks: string[][]): void {
+  insertBatches(postId: number, chunks: string[][], ownJid: string | null): void {
     const stmt = this.raw.prepare(
       `INSERT INTO status_batches (post_id, batch_index, recipient_count, jids_json, status) VALUES (?, ?, ?, ?, 'pending')`,
     )
     const tx = this.raw.transaction((rows: string[][]) => {
-      rows.forEach((jids, index) => stmt.run(postId, index, jids.length, JSON.stringify(jids)))
+      rows.forEach((jids, index) => {
+        const audience = jids.filter((jid) => jid !== ownJid).length
+        stmt.run(postId, index, audience, JSON.stringify(jids))
+      })
     })
     tx(chunks)
+  }
+
+  resetFailedBatches(postId: number): void {
+    this.raw.prepare(`UPDATE status_batches SET status = 'pending', error = NULL, sent_at = NULL WHERE post_id = ? AND status = 'failed'`).run(postId)
+  }
+
+  findPostByMessage(messageId: string): number | null {
+    const row = this.raw.prepare('SELECT post_id FROM status_batches WHERE wa_message_id = ?').get(messageId) as { post_id: number } | undefined
+    return row?.post_id ?? null
+  }
+
+  recordStatusView(input: { postId: number; viewerJid: string; phone: string; name: string; viewedAt: string }): boolean {
+    const info = this.raw.prepare(
+      `INSERT INTO status_views (post_id, viewer_jid, phone, name, viewed_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(post_id, viewer_jid) DO NOTHING`,
+    ).run(input.postId, input.viewerJid, input.phone, input.name, input.viewedAt)
+    return info.changes > 0
+  }
+
+  contactNameByPhone(phone: string): string {
+    const row = this.raw.prepare('SELECT name FROM contacts WHERE phone = ?').get(phone) as { name: string } | undefined
+    return row?.name ?? ''
+  }
+
+  countViews(postIds: number[]): Map<number, number> {
+    const counts = new Map<number, number>()
+    if (postIds.length === 0) return counts
+    const marks = postIds.map(() => '?').join(',')
+    const rows = this.raw.prepare(
+      `SELECT post_id, COUNT(*) AS n FROM status_views WHERE post_id IN (${marks}) GROUP BY post_id`,
+    ).all(...postIds) as { post_id: number; n: number }[]
+    for (const row of rows) counts.set(row.post_id, row.n)
+    return counts
+  }
+
+  listViews(postId: number, opts: { q: string; tag: string; source: SourceFilter; limit: number; offset: number }): { total: number; items: StatusView[] } {
+    const where = this.viewWhere(opts.q, opts.tag, opts.source)
+    const total = (this.raw.prepare(
+      `SELECT COUNT(*) AS n FROM status_views v LEFT JOIN contacts c ON c.phone = v.phone WHERE v.post_id = ? AND ${where.sql}`,
+    ).get(postId, ...where.params) as { n: number }).n
+    const rows = this.raw.prepare(
+      `SELECT v.viewer_jid, v.phone, COALESCE(NULLIF(c.name, ''), v.name) AS name, v.viewed_at
+       FROM status_views v LEFT JOIN contacts c ON c.phone = v.phone
+       WHERE v.post_id = ? AND ${where.sql}
+       ORDER BY v.viewed_at DESC LIMIT ? OFFSET ?`,
+    ).all(postId, ...where.params, opts.limit, opts.offset) as { viewer_jid: string; phone: string; name: string; viewed_at: string }[]
+    return {
+      total,
+      items: rows.map((row) => ({ viewerJid: row.viewer_jid, phone: row.phone, name: row.name, viewedAt: row.viewed_at })),
+    }
+  }
+
+  failStuckRunning(olderThanIso: string, now: string): number {
+    const info = this.raw.prepare(
+      `UPDATE status_posts
+       SET status = 'failed', finished_at = ?, error = ?
+       WHERE status = 'running' AND started_at IS NOT NULL AND started_at <= ?`,
+    ).run(now, 'Публикация зависла и остановлена. Её можно повторить.', olderThanIso)
+    return info.changes
   }
 
   markBatch(id: number, patch: { status: 'sent' | 'failed'; error?: string | null; waMessageId?: string | null }): void {
@@ -519,6 +596,27 @@ export class AppDb {
     return new Map(rows.map((row) => [row.lid, row.phone]))
   }
 
+  private viewWhere(q: string, tag: string, source: SourceFilter): { sql: string; params: string[] } {
+    const folded = foldText(q)
+    const digits = q.replace(/\D/g, '')
+    const phoneLike = likeContains(digits || folded)
+    const nameLike = likeContains(folded)
+    const tagFold = tag.trim() ? foldText(tag) : ''
+    const sourceSql = source === 'whatsapp'
+      ? `EXISTS (SELECT 1 FROM contact_sources sw WHERE sw.contact_id = c.id AND sw.source = 'whatsapp')`
+      : source === 'phone'
+        ? `EXISTS (SELECT 1 FROM contact_sources sp WHERE sp.contact_id = c.id AND sp.source = 'phone')`
+        : source === 'both'
+          ? `EXISTS (SELECT 1 FROM contact_sources sw WHERE sw.contact_id = c.id AND sw.source = 'whatsapp') AND EXISTS (SELECT 1 FROM contact_sources sp WHERE sp.contact_id = c.id AND sp.source = 'phone')`
+          : '1=1'
+    return {
+      sql: `${sourceSql}
+        AND (? = '' OR v.phone LIKE ? ESCAPE '\\' OR v.name LIKE ? ESCAPE '\\' OR c.name_fold LIKE ? ESCAPE '\\')
+        AND (? = '' OR c.id IN (SELECT contact_id FROM contact_tags WHERE tag_fold = ?))`,
+      params: [q.trim(), phoneLike, nameLike, nameLike, tagFold, tagFold],
+    }
+  }
+
   private contactWhere(q: string, tag: string, source: SourceFilter): { sql: string; params: string[] } {
     const folded = foldText(q)
     const digits = q.replace(/\D/g, '')
@@ -619,6 +717,9 @@ export function openDatabase(file: string): AppDb {
       body TEXT NOT NULL DEFAULT '',
       caption TEXT NOT NULL DEFAULT '',
       media_path TEXT,
+      thumb_path TEXT,
+      media_width INTEGER,
+      media_height INTEGER,
       original_name TEXT,
       background_color TEXT,
       font INTEGER,
@@ -650,6 +751,16 @@ export function openDatabase(file: string): AppDb {
       sent_at TEXT,
       UNIQUE(post_id, batch_index)
     );
+    CREATE TABLE IF NOT EXISTS status_views (
+      id INTEGER PRIMARY KEY,
+      post_id INTEGER NOT NULL REFERENCES status_posts(id) ON DELETE CASCADE,
+      viewer_jid TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      viewed_at TEXT NOT NULL,
+      UNIQUE(post_id, viewer_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_status_views_post ON status_views(post_id, viewed_at);
     CREATE TABLE IF NOT EXISTS import_runs (
       id INTEGER PRIMARY KEY,
       filename TEXT NOT NULL,
@@ -668,7 +779,15 @@ export function openDatabase(file: string): AppDb {
       created_at TEXT NOT NULL
     );
   `)
+  ensureColumn(raw, 'status_posts', 'thumb_path', 'TEXT')
+  ensureColumn(raw, 'status_posts', 'media_width', 'INTEGER')
+  ensureColumn(raw, 'status_posts', 'media_height', 'INTEGER')
   return new AppDb(raw)
+}
+
+function ensureColumn(raw: Database.Database, table: string, column: string, ddl: string): void {
+  const rows = raw.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+  if (!rows.some((row) => row.name === column)) raw.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`)
 }
 
 type AccountRow = {
@@ -701,6 +820,9 @@ type PostRow = {
   body: string
   caption: string
   media_path: string | null
+  thumb_path: string | null
+  media_width: number | null
+  media_height: number | null
   original_name: string | null
   background_color: string | null
   font: number | null
@@ -774,6 +896,9 @@ function mapPost(row: PostRow): StatusPost {
     body: row.body,
     caption: row.caption,
     mediaPath: row.media_path,
+    thumbPath: row.thumb_path,
+    mediaWidth: row.media_width,
+    mediaHeight: row.media_height,
     originalName: row.original_name,
     backgroundColor: row.background_color,
     font: row.font,

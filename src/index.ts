@@ -21,6 +21,12 @@ function log(level: 'info' | 'warn' | 'error', message: string, accountId?: stri
   }
 }
 
+if (config.waProxyLabel) {
+  log('info', `Трафик WhatsApp идёт через прокси ${config.waProxyLabel}. Сама панель ходит в интернет напрямую.`)
+} else {
+  log('info', 'Прокси для WhatsApp не задан, сокет и медиа идут напрямую.')
+}
+
 const resumed = db.resetRunningToQueued()
 if (resumed > 0) log('warn', `В очередь возвращено прерванных публикаций: ${resumed}`)
 

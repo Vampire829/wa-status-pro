@@ -33,6 +33,8 @@ test('панель отдаёт вход на русском и не пуска�
     syncFullHistory: false,
     warnDefaultPassword: false,
     warnDefaultSecret: false,
+    waProxyUrl: null,
+    waProxyLabel: null,
   } satisfies AppConfig
   const wa = new WaManager(db, config, () => undefined)
   const app = createApp({ config, db, wa })
@@ -74,6 +76,10 @@ test('панель отдаёт вход на русском и не пуска�
     const homeHtml = await home.text()
     assert.match(homeHtml, /Обзор/)
     assert.match(homeHtml, /Из WhatsApp/)
+    const journal = await fetch(`http://127.0.0.1:${port}/health`, { headers: { cookie: cookie.split(';')[0] ?? '' } })
+    const healthHtml = await journal.text()
+    assert.match(healthHtml, /Прокси WhatsApp не задан/)
+    assert.match(healthHtml, /Проверить прокси/)
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
     db.close()

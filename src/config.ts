@@ -2,6 +2,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { readProxyEnv } from './proxy.js'
+
 export type AppConfig = {
   host: string
   port: number
@@ -22,6 +24,8 @@ export type AppConfig = {
   syncFullHistory: boolean
   warnDefaultPassword: boolean
   warnDefaultSecret: boolean
+  waProxyUrl: string | null
+  waProxyLabel: string | null
 }
 
 function intEnv(name: string, fallback: number, min: number, max: number): number {
@@ -66,6 +70,7 @@ export function loadConfig(): AppConfig {
     throw new Error('Задайте ADMIN_PASSWORD длиной не меньше 8 символов')
   }
   const session = ensureSecret(dataDir)
+  const proxy = readProxyEnv(process.env.WA_PROXY_URL)
   return {
     host: process.env.HOST?.trim() || '0.0.0.0',
     port: intEnv('PORT', 8080, 1, 65535),
@@ -86,5 +91,7 @@ export function loadConfig(): AppConfig {
     syncFullHistory: boolEnv('WA_SYNC_FULL_HISTORY', false),
     warnDefaultPassword: adminPassword === 'change-me-please',
     warnDefaultSecret: session.generated || (process.env.SESSION_SECRET ?? '').includes('замените'),
+    waProxyUrl: proxy?.url ?? null,
+    waProxyLabel: proxy?.config.redacted ?? null,
   }
 }

@@ -149,7 +149,7 @@ export function createApp(deps: Deps): express.Express {
       res.redirect('/accounts?msg=not_found')
       return
     }
-    res.type('html').send(page(req, config, account.label, 'accounts', accountPage(account, csrf(res), db.countDiscovered(account.id))))
+    res.type('html').send(page(req, config, account.label, 'accounts', accountPage(account, csrf(res), db.countDiscovered(account.id), config.waProxyLabel)))
   })
 
   app.get('/accounts/:id/state', (req, res) => {
@@ -519,8 +519,16 @@ export function createApp(deps: Deps): express.Express {
       uptime,
       batchSize: config.batchSize,
       batchDelayMs: config.batchDelayMs,
+      proxyLabel: config.waProxyLabel,
+      proxyCheck: wa.lastProxyProbe,
+      csrf: csrf(res),
       logs: db.listLogs(80),
     })))
+  })
+
+  app.post('/health/proxy-check', async (_req, res) => {
+    await wa.checkProxy()
+    res.redirect('/health')
   })
 
   app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {

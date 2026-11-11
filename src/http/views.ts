@@ -212,8 +212,8 @@ export function accountsPage(accounts: Account[], csrf: string): string {
   </div>`
 }
 
-export function accountPage(account: Account, csrf: string, discovered: number): string {
-  const qr = account.status === 'connected' ? '' : `<img id="qr-image" class="qr hidden" alt="QR-код для привязки WhatsApp">`
+export function accountPage(account: Account, csrf: string, discovered: number, proxyLabel: string | null): string {
+  const qr = account.status === 'connected' ? '' : `<img id="qr-image" class="qr hidden" alt="QR-код для привязки WhatsApp" decoding="async">`
   return `<h1>${esc(account.label)}</h1>
   <div id="qr-root" data-url="/accounts/${esc(account.id)}/state" data-status="${esc(account.status)}">
     <p id="acc-status">${badge(account.status, ACCOUNT_STATUS_RU[account.status])}</p>
@@ -221,6 +221,7 @@ export function accountPage(account: Account, csrf: string, discovered: number):
     <p id="acc-error" class="muted">${esc(account.lastError || '')}</p>
     <p id="acc-discovered">В кэше WhatsApp: ${discovered}. ${account.historyComplete ? 'История чатов получена.' : 'История чатов может ещё догружаться.'}</p>
     ${qr}
+    <p id="qr-hint" class="hint">Код на экране остаётся, пока готовится следующий. Страница не перезагружается.</p>
   </div>
   <div class="panel">
     <h2>Как привязать</h2>
@@ -230,6 +231,7 @@ export function accountPage(account: Account, csrf: string, discovered: number):
       <li>В списке устройств появится WA Status Pro.</li>
     </ol>
     <p class="hint">На своём телефоне статус, отправленный отсюда, может висеть с пометкой «ожидание». У получателей он открывается обычным образом.</p>
+    <p class="hint">${proxyLabel ? `Сокет и медиа WhatsApp идут через ${esc(proxyLabel)}. Страницы панели открываются напрямую.` : 'Прокси не задан: WhatsApp подключается с этого сервера напрямую.'}</p>
   </div>
   <div class="panel">
     <h2>Контакты из WhatsApp</h2>
@@ -454,6 +456,9 @@ export function healthPage(input: {
   uptime: string
   batchSize: number
   batchDelayMs: number
+  proxyLabel: string | null
+  proxyCheck: { ok: boolean; direct: boolean; latencyMs: number; status?: number; error?: string; at: string } | null
+  csrf: string
   logs: { level: string; message: string; createdAt: string; accountId: string | null }[]
 }): string {
   const rows = input.accounts.map((account) => `<tr>
@@ -469,8 +474,27 @@ export function healthPage(input: {
     <td>${esc(entry.level)}</td>
     <td>${esc(entry.message)}</td>
   </tr>`).join('')
+  const proxyLine = input.proxyLabel
+    ? `Прокси WhatsApp: ${esc(input.proxyLabel)}. Панель открывается напрямую.`
+    : 'Прокси WhatsApp не задан, сокет и медиа идут напрямую с этого сервера.'
+  const check = input.proxyCheck
+  const checkLine = !check
+    ? ''
+    : check.ok
+      ? `<p>Последняя проверка ${esc(formatMoscow(check.at))}: web.whatsapp.com ответил ${check.status} за ${check.latencyMs} мс ${check.direct ? 'напрямую' : 'через прокси'}.</p>`
+      : `<p>Последняя проверка ${esc(formatMoscow(check.at))} не удалась за ${check.latencyMs} мс ${check.direct ? 'напрямую' : 'через прокси'}: ${esc(check.error || 'ошибка')}.</p>`
   return `<h1>Журнал и связь</h1>
   <p class="muted">Процесс работает ${esc(input.uptime)}. Пачка статуса: ${input.batchSize} номеров, пауза ${Math.round(input.batchDelayMs / 1000)} с. Очередь ${input.queue.queued} / план ${input.queue.scheduled} / сейчас ${input.queue.running}.</p>
+  <div class="panel">
+    <h2>Прокси</h2>
+    <p>${proxyLine}</p>
+    ${checkLine}
+    <form method="post" action="/health/proxy-check">
+      <input type="hidden" name="csrf" value="${esc(input.csrf)}">
+      <button type="submit">Проверить прокси</button>
+    </form>
+    <p class="hint">Проверка открывает https://web.whatsapp.com тем же каналом, что сокет и загрузка медиа. Запрос самой панели к вам в браузер через прокси не идёт.</p>
+  </div>
   <div class="panel"><table>
     <tr><th>Номер</th><th>Состояние</th><th>Телефон</th><th>Кэш WhatsApp</th><th>История</th><th>Сообщение</th></tr>
     ${rows || '<tr><td colspan="6">Номеров нет</td></tr>'}

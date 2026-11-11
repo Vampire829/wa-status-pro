@@ -19,9 +19,14 @@ if (qrRoot instanceof HTMLElement) {
     if (discovered) discovered.textContent = `В кэше WhatsApp: ${data.discovered}`
     if (image instanceof HTMLImageElement) {
       if (data.qrDataUrl) {
-        image.src = data.qrDataUrl
+        if (image.dataset.qr !== data.qrDataUrl) {
+          image.src = data.qrDataUrl
+          image.dataset.qr = data.qrDataUrl
+        }
         image.classList.remove('hidden')
-      } else image.classList.add('hidden')
+      } else if (data.status !== 'qr') {
+        image.classList.add('hidden')
+      }
     }
     if (data.status === 'connected' && qrRoot.dataset.status !== 'connected') {
       window.location.reload()
@@ -29,14 +34,26 @@ if (qrRoot instanceof HTMLElement) {
     }
     qrRoot.dataset.status = data.status
   }
+  let pending = false
   const tick = async () => {
+    if (pending) {
+      window.setTimeout(tick, 2000)
+      return
+    }
+    pending = true
     try {
-      const response = await fetch(qrRoot.dataset.url || '', { headers: { Accept: 'application/json' } })
+      const response = await fetch(qrRoot.dataset.url || '', {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(4000),
+      })
       if (response.ok) paint(await response.json())
     } catch {
-      /* следующая попытка */
+      /* следующая попытка, панель не ждёт зависший опрос */
+    } finally {
+      pending = false
+      window.setTimeout(tick, 2000)
     }
-    window.setTimeout(tick, 2000)
   }
   tick()
 }

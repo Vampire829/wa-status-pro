@@ -7,6 +7,7 @@ import {
   type WAVersion,
 } from '@whiskeysockets/baileys'
 import makeWASocket from '@whiskeysockets/baileys'
+import type { Agent as HttpsAgent } from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
 import pino from 'pino'
@@ -16,6 +17,8 @@ import type { AppConfig } from './config.js'
 import { extractWhatsAppPeers, type WaPeerInput } from './contactsMerge.js'
 import type { AppDb } from './db.js'
 import { WaSendError } from './errors.js'
+import { createProxyAgent, probeWhatsApp, redactProxyMessage, type ProxyProbe } from './proxy.js'
+import { planReconnect } from './reconnect.js'
 import type { AccountStatus } from './types.js'
 import { sleep } from './time.js'
 
@@ -33,6 +36,14 @@ type Session = {
   suppressReconnect: boolean
   backoffMs: number
   timer: NodeJS.Timeout | null
+  booting: boolean
+  wasConnected: boolean
+  qrSeq: number
+  qrAnnounced: boolean
+  qrRefreshStrikes: number
+  lastWarnWait: number
+  discoveredCount: number
+  updates: Promise<void>
 }
 
 export type RuntimeSnapshot = {
@@ -53,17 +64,13 @@ export type StatusContent =
   | { kind: 'image'; filePath: string; caption: string }
   | { kind: 'video'; filePath: string; caption: string }
 
-const STOP_CODES = new Set<number>([
-  DisconnectReason.loggedOut,
-  DisconnectReason.forbidden,
-  DisconnectReason.connectionReplaced,
-  DisconnectReason.badSession,
-])
-
 export class WaManager {
   private readonly sessions = new Map<string, Session>()
   private version: WAVersion | undefined
   private readonly logger: pino.Logger
+  readonly proxyAgent: HttpsAgent | undefined
+  readonly proxyLabel: string | null
+  lastProxyProbe: ProxyProbe | null = null
 
   constructor(
     private readonly db: AppDb,
@@ -71,6 +78,22 @@ export class WaManager {
     private readonly log: Logger,
   ) {
     this.logger = pino({ level: config.baileysLogLevel })
+    this.proxyLabel = config.waProxyLabel
+    this.proxyAgent = config.waProxyUrl ? createProxyAgent(config.waProxyUrl) : undefined
+  }
+
+  async checkProxy(): Promise<ProxyProbe> {
+    const result = await probeWhatsApp(this.proxyAgent)
+    if (result.error) result.error = redactProxyMessage(result.error)
+    this.lastProxyProbe = result
+    const where = this.proxyLabel ? `через ${this.proxyLabel}` : 'напрямую, прокси не задан'
+    this.log(
+      result.ok ? 'info' : 'warn',
+      result.ok
+        ? `Проверка web.whatsapp.com ${where}: ответ ${result.status} за ${result.latencyMs} мс`
+        : `Проверка web.whatsapp.com ${where} не удалась за ${result.latencyMs} мс: ${result.error ?? 'ошибка'}`,
+    )
+    return result
   }
 
   async restore(): Promise<void> {
@@ -86,42 +109,76 @@ export class WaManager {
     }
   }
 
-  async start(accountId: string): Promise<void> {
+  async start(accountId: string, opts: { keepQr?: boolean } = {}): Promise<void> {
     const account = this.db.getAccount(accountId)
     if (!account) return
     const session = this.ensure(accountId)
-    if (session.sock && (session.state === 'connected' || session.state === 'connecting' || session.state === 'qr')) return
+    if (session.booting || session.sock) return
+    session.booting = true
     session.suppressReconnect = false
-    if (session.timer) clearTimeout(session.timer)
+    if (session.timer) {
+      clearTimeout(session.timer)
+      session.timer = null
+    }
     const generation = ++session.generation
-    session.state = 'connecting'
-    session.qrDataUrl = null
-    this.persist(accountId, { status: 'connecting', lastError: null, autoConnect: true })
-    const dir = this.sessionDir(accountId)
-    await fs.promises.mkdir(dir, { recursive: true })
-    const { state, saveCreds } = await useMultiFileAuthState(dir)
-    const sock = makeWASocket({
-      version: this.version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, this.logger),
-      },
-      logger: this.logger,
-      browser: Browsers.ubuntu('WA Status Pro'),
-      syncFullHistory: this.config.syncFullHistory,
-      shouldSyncHistoryMessage: () => true,
-      markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: false,
-      getMessage: async () => undefined,
-      shouldIgnoreJid: (jid) => jid.endsWith('@g.us') || jid.endsWith('@newsletter') || jid === 'status@broadcast',
-    })
-    session.sock = sock
-    sock.ev.on('creds.update', saveCreds)
-    this.bindContacts(accountId, generation, sock)
-    sock.ev.on('connection.update', (update) => {
-      if (session.generation !== generation) return
-      void this.onConnection(accountId, generation, update)
-    })
+    if (!opts.keepQr) {
+      session.qrDataUrl = null
+      session.qrAnnounced = false
+      session.state = 'connecting'
+      session.lastError = null
+      this.persist(accountId, { status: 'connecting', lastError: null, autoConnect: true })
+    }
+    try {
+      const dir = this.sessionDir(accountId)
+      await fs.promises.mkdir(dir, { recursive: true })
+      const { state, saveCreds } = await useMultiFileAuthState(dir)
+      const sock = makeWASocket({
+        version: this.version,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, this.logger),
+        },
+        logger: this.logger,
+        browser: Browsers.ubuntu('WA Status Pro'),
+        syncFullHistory: this.config.syncFullHistory,
+        shouldSyncHistoryMessage: () => true,
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
+        connectTimeoutMs: 30_000,
+        qrTimeout: 60_000,
+        ...(this.proxyAgent
+          ? {
+              agent: this.proxyAgent,
+              fetchAgent: this.proxyAgent,
+              options: { httpsAgent: this.proxyAgent, httpAgent: this.proxyAgent, proxy: false as const },
+            }
+          : {}),
+        getMessage: async () => undefined,
+        shouldIgnoreJid: (jid) => jid.endsWith('@g.us') || jid.endsWith('@newsletter') || jid === 'status@broadcast',
+      })
+      if (session.generation !== generation) {
+        sock.end(undefined)
+        return
+      }
+      session.sock = sock
+      sock.ev.on('creds.update', saveCreds)
+      this.bindContacts(accountId, generation, sock)
+      sock.ev.on('connection.update', (update) => {
+        if (session.generation !== generation) return
+        session.updates = session.updates
+          .then(() => this.onConnection(accountId, generation, update))
+          .catch((error: unknown) => {
+            this.log('error', redactProxyMessage(messageOf(error)), accountId)
+          })
+      })
+    } catch (error) {
+      session.state = 'error'
+      session.lastError = redactProxyMessage(messageOf(error))
+      this.persist(accountId, { status: 'error', lastError: session.lastError })
+      this.log('error', session.lastError, accountId)
+    } finally {
+      session.booting = false
+    }
   }
 
   async restart(accountId: string): Promise<void> {
@@ -157,7 +214,7 @@ export class WaManager {
       qrDataUrl: session?.qrDataUrl ?? null,
       phone: session?.phone ?? account?.phone ?? null,
       lastError: session?.lastError ?? account?.lastError ?? null,
-      discovered: this.db.countDiscovered(accountId),
+      discovered: session?.discoveredCount ?? this.db.countDiscovered(accountId),
       historyComplete: account?.historyComplete ?? false,
     }
   }
@@ -257,6 +314,14 @@ export class WaManager {
       suppressReconnect: false,
       backoffMs: 2000,
       timer: null,
+      booting: false,
+      wasConnected: account?.status === 'connected' || Boolean(account?.phone),
+      qrSeq: 0,
+      qrAnnounced: false,
+      qrRefreshStrikes: 0,
+      lastWarnWait: 0,
+      discoveredCount: this.db.countDiscovered(accountId),
+      updates: Promise.resolve(),
     }
     this.sessions.set(accountId, session)
     return session
@@ -303,22 +368,40 @@ export class WaManager {
       this.db.upsertLid(accountId, lid.lid, { phone: lid.phone, name: lid.name, nameRank: lid.nameRank })
     }
     if (extracted.contacts.length > 0) this.db.upsertDiscovered(accountId, extracted.contacts)
+    const session = this.sessions.get(accountId)
+    if (session) session.discoveredCount = this.db.countDiscovered(accountId)
   }
 
   private async onConnection(accountId: string, generation: number, update: { connection?: string; qr?: string; lastDisconnect?: { error?: unknown } }): Promise<void> {
     const session = this.sessions.get(accountId)
     if (!session || session.generation !== generation) return
     if (update.qr) {
-      session.qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 1, width: 320, errorCorrectionLevel: 'M' })
+      session.qrRefreshStrikes = 0
+      session.backoffMs = 2000
       session.state = 'qr'
       session.lastError = null
+      const seq = ++session.qrSeq
+      if (!session.qrAnnounced) {
+        session.qrAnnounced = true
+        this.log('info', 'QR готов к сканированию', accountId)
+      }
       this.persist(accountId, { status: 'qr', lastError: null })
-      this.log('info', 'QR обновлён, можно сканировать в панели', accountId)
+      void QRCode.toDataURL(update.qr, { margin: 1, width: 280, errorCorrectionLevel: 'M' })
+        .then((url) => {
+          if (session.generation !== generation || session.qrSeq !== seq) return
+          session.qrDataUrl = url
+        })
+        .catch((error: unknown) => {
+          this.log('warn', `Не удалось нарисовать QR: ${messageOf(error)}`, accountId)
+        })
     }
     if (update.connection === 'open') {
       session.state = 'connected'
       session.qrDataUrl = null
+      session.qrAnnounced = false
+      session.wasConnected = true
       session.backoffMs = 2000
+      session.qrRefreshStrikes = 0
       session.lastError = null
       const rawId = session.sock?.user?.id
       const phone = rawId ? rawId.split('@')[0]?.split(':')[0]?.replace(/\D/g, '') ?? null : null
@@ -327,31 +410,40 @@ export class WaManager {
       this.log('info', phone ? `Номер подключён: +${phone}` : 'Номер подключён', accountId)
     }
     if (update.connection === 'close') {
-      const code = statusCodeOf(update.lastDisconnect?.error)
-      const loggedOut = code === DisconnectReason.loggedOut
+      const plan = planReconnect({
+        code: statusCodeOf(update.lastDisconnect?.error),
+        showingQr: session.state === 'qr' || Boolean(session.qrDataUrl),
+        wasConnected: session.wasConnected,
+        backoffMs: session.backoffMs,
+        qrRefreshStrikes: session.qrRefreshStrikes,
+      })
       session.sock = null
-      session.qrDataUrl = null
       if (session.suppressReconnect) return
-      if (loggedOut || (code != null && STOP_CODES.has(code))) {
+      if (!plan.keepQr) {
+        session.qrDataUrl = null
+        session.qrAnnounced = false
+      }
+      session.qrRefreshStrikes = plan.countStrike ? session.qrRefreshStrikes + 1 : 0
+      session.backoffMs = plan.nextBackoffMs
+      if (plan.action === 'stop') {
+        const loggedOut = plan.reason === 'logged_out'
         session.state = loggedOut ? 'logged_out' : 'error'
-        const text = loggedOut
-          ? 'WhatsApp сбросил сессию. Отсканируйте QR заново.'
-          : `Соединение остановлено (код ${code}). Нажмите «Подключить снова».`
-        session.lastError = text
-        this.persist(accountId, { status: session.state, lastError: text, autoConnect: loggedOut ? false : true })
-        this.log('warn', text, accountId)
+        session.lastError = plan.message
+        this.persist(accountId, { status: session.state, lastError: plan.message, autoConnect: !loggedOut })
+        this.log('warn', plan.message, accountId)
         return
       }
-      session.state = 'reconnecting'
-      const wait = session.backoffMs
-      session.backoffMs = Math.min(session.backoffMs * 2, 60_000)
-      session.lastError = 'Связь прервалась, повторяем подключение'
-      this.persist(accountId, { status: 'reconnecting', lastError: session.lastError })
-      this.log('warn', `Переподключение через ${Math.round(wait / 1000)} с`, accountId)
+      session.state = plan.keepQr ? 'qr' : 'reconnecting'
+      session.lastError = plan.keepQr ? 'Обновляем QR. Предыдущий код ещё можно сканировать.' : plan.message
+      this.persist(accountId, { status: session.state, lastError: session.lastError })
+      const repeat = plan.log === 'warn' && plan.waitMs === session.lastWarnWait
+      this.log(repeat ? 'info' : plan.log, plan.message, accountId)
+      if (plan.log === 'warn') session.lastWarnWait = plan.waitMs
+      if (session.timer) clearTimeout(session.timer)
       session.timer = setTimeout(() => {
         if (session.generation !== generation || session.suppressReconnect) return
-        void this.start(accountId)
-      }, wait)
+        void this.start(accountId, { keepQr: plan.keepQr })
+      }, plan.waitMs)
     }
   }
 

@@ -119,131 +119,13 @@ if (statusForm instanceof HTMLFormElement) {
       if (box instanceof HTMLElement) box.textContent = 'Не удалось посчитать аудиторию'
     }
   }
-  const preview = document.querySelector('#story-preview')
-  const paintPreview = () => {
-    if (!(preview instanceof HTMLElement)) return
-    const kind = statusForm.querySelector('input[name="kind"]:checked')
-    const value = kind instanceof HTMLInputElement ? kind.value : 'text'
-    const text = statusForm.querySelector('textarea[name="text"]')
-    const caption = statusForm.querySelector('input[name="caption"]')
-    const color = statusForm.querySelector('input[name="background_color"]')
-    const fileInput = statusForm.querySelector(value === 'video' ? 'input[name="video"]' : 'input[name="image"]')
-    const file = fileInput instanceof HTMLInputElement ? fileInput.files?.[0] : undefined
-    const captionText = caption instanceof HTMLInputElement ? caption.value : ''
-    if (value === 'text') {
-      const body = text instanceof HTMLTextAreaElement ? text.value : ''
-      const bg = color instanceof HTMLInputElement ? color.value : '#0e6b52'
-      preview.style.background = bg
-      preview.innerHTML = `<div class="story-text"></div>`
-      const node = preview.querySelector('.story-text')
-      if (node) node.textContent = body || 'Текст статуса'
-      return
-    }
-    preview.style.background = '#111'
-    preview.innerHTML = ''
-    if (!file) {
-      preview.textContent = 'Выберите файл, чтобы увидеть предпросмотр'
-      return
-    }
-    const url = URL.createObjectURL(file)
-    const media = document.createElement(value === 'video' ? 'video' : 'img')
-    media.className = 'story-media'
-    media.src = url
-    if (media instanceof HTMLVideoElement) { media.muted = true; media.controls = true; media.playsInline = true }
-    preview.append(media)
-    const copy = document.createElement('div')
-    copy.className = 'story-copy'
-    copy.textContent = captionText
-    preview.append(copy)
-  }
-  statusForm.addEventListener('change', () => { showKind(); showWhen(); paintPreview(); void refreshCount() })
-  statusForm.addEventListener('input', () => { paintPreview(); void refreshCount() })
+  statusForm.addEventListener('change', () => {
+    showKind()
+    showWhen()
+    void refreshCount()
+  })
+  statusForm.addEventListener('input', () => { void refreshCount() })
   showKind()
   showWhen()
-  paintPreview()
   void refreshCount()
-}
-
-const cooldown = document.querySelector('#publish-cooldown')
-if (cooldown instanceof HTMLElement) {
-  const tick = async () => {
-    let until = cooldown.dataset.until ? Date.parse(cooldown.dataset.until) : 0
-    if (!until) {
-      try {
-        const response = await fetch('/api/cooldown', { cache: 'no-store', signal: AbortSignal.timeout(4000) })
-        if (response.ok) {
-          const data = await response.json()
-          until = data.until ? Date.parse(data.until) : 0
-          if (data.running) cooldown.textContent = 'Сейчас уже идёт публикация. Новая встанет в очередь.'
-        }
-      } catch { /* тихий повтор */ }
-    }
-    const left = until ? Math.max(0, until - Date.now()) : 0
-    if (left > 0) {
-      const seconds = Math.ceil(left / 1000)
-      const minutes = Math.floor(seconds / 60)
-      cooldown.hidden = false
-      cooldown.textContent = `Следующую публикацию можно отправить через ${minutes}:${String(seconds % 60).padStart(2, '0')}`
-    } else if (!cooldown.textContent?.includes('идёт публикация')) {
-      cooldown.hidden = true
-    }
-    window.setTimeout(tick, 1000)
-  }
-  void tick()
-}
-
-const storyDataNode = document.querySelector('#story-data')
-const stage = document.querySelector('#story-stage')
-const card = document.querySelector('#story-card')
-if (storyDataNode && stage instanceof HTMLElement && card instanceof HTMLElement) {
-  const stories = JSON.parse(storyDataNode.textContent || '[]')
-  const byId = new Map(stories.map((story) => [String(story.id), story]))
-  const close = () => { stage.hidden = true; stage.classList.add('hidden'); card.innerHTML = '' }
-  const open = (id) => {
-    const story = byId.get(String(id))
-    if (!story) return
-    card.innerHTML = ''
-    card.style.background = story.color || '#0b141a'
-    if (story.kind === 'text') {
-      const text = document.createElement('div')
-      text.className = 'story-text'
-      text.textContent = story.text
-      card.append(text)
-    } else if (story.mediaUrl) {
-      const media = document.createElement(story.kind === 'video' ? 'video' : 'img')
-      media.className = 'story-media'
-      media.src = story.mediaUrl
-      if (media instanceof HTMLVideoElement) { media.controls = true; media.autoplay = true; media.playsInline = true }
-      card.append(media)
-    }
-    const copy = document.createElement('div')
-    copy.className = 'story-copy'
-    const title = document.createElement('h3')
-    title.textContent = story.label
-    const meta = document.createElement('p')
-    const expires = story.expires ? Date.parse(story.expires) : 0
-    const left = expires ? Math.max(0, expires - Date.now()) : 0
-    const hours = Math.floor(left / 3600000)
-    const minutes = Math.floor((left % 3600000) / 60000)
-    meta.textContent = `${story.posted}. ${left > 0 ? `Исчезнет через ${hours} ч ${minutes} мин` : '24 часа прошли'}. 👁 ${story.views}`
-    const link = document.createElement('a')
-    link.href = `/status/${story.id}/viewers`
-    link.textContent = 'Кто смотрел'
-    link.style.color = 'white'
-    copy.append(title, meta, link)
-    if (story.caption) {
-      const caption = document.createElement('p')
-      caption.textContent = story.caption
-      copy.append(caption)
-    }
-    card.append(copy)
-    stage.hidden = false
-    stage.classList.remove('hidden')
-  }
-  document.querySelectorAll('[data-open-story]').forEach((node) => {
-    node.addEventListener('click', () => open(node.getAttribute('data-open-story')))
-  })
-  document.querySelector('#story-close')?.addEventListener('click', close)
-  stage.addEventListener('click', (event) => { if (event.target === stage) close() })
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') close() })
 }

@@ -66,9 +66,6 @@ export type StatusPost = {
   body: string
   caption: string
   mediaPath: string | null
-  thumbPath: string | null
-  mediaWidth: number | null
-  mediaHeight: number | null
   originalName: string | null
   backgroundColor: string | null
   font: number | null
@@ -104,13 +101,6 @@ export type ImportIssue = {
   row?: number
   raw: string
   reason: string
-}
-
-export type StatusView = {
-  viewerJid: string
-  phone: string
-  name: string
-  viewedAt: string
 }
 
 export type ImportRun = {

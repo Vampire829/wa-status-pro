@@ -12,7 +12,6 @@ import { contactsToCsv, contactsToXlsx } from '../exportContacts.js'
 import { ImportFormatError } from '../errors.js'
 import { buildImportPlan, parseContactFile } from '../importContacts.js'
 import { prepareStatusMedia } from '../media.js'
-import { cooldownRemainingMs } from '../statusLogic.js'
 import { moscowLocalToUtcIso } from '../time.js'
 import type { AudienceSource, PostKind, SourceFilter } from '../types.js'
 import type { WaManager } from '../waManager.js'
@@ -32,8 +31,6 @@ import {
   statusDetailPage,
   statusFormPage,
   statusListPage,
-  storiesPage,
-  viewersPage,
 } from './views.js'
 
 type Deps = { config: AppConfig; db: AppDb; wa: WaManager }
@@ -332,40 +329,10 @@ export function createApp(deps: Deps): express.Express {
     res.send(buffer)
   })
 
-  app.get('/api/cooldown', (_req, res) => {
-    const now = Date.now()
-    const waitMs = cooldownRemainingMs(db.lastFinishedAt(), config.minPublishIntervalMs, now)
-    const running = db.queueCounts().running
-    res.json({ waitMs, until: waitMs > 0 ? new Date(now + waitMs).toISOString() : null, running })
-  })
-
   app.get('/api/audience', (req, res) => {
     const source = audienceOf(q(req.query.source))
     const tag = q(req.query.tag).trim()
     res.json({ count: db.countAudience(source, tag || null) })
-  })
-
-  app.get('/stories', (req, res) => {
-    const posts = db.listPosts(40).filter((post) => post.status === 'done' || post.status === 'partial')
-    const counts = db.countViews(posts.map((post) => post.id))
-    const accounts = new Map(db.listAccounts().map((account) => [account.id, account]))
-    res.type('html').send(page(req, config, 'Мои статусы', 'stories', storiesPage({
-      posts,
-      accounts,
-      views: counts,
-      tags: db.listTags(),
-      csrf: csrf(res),
-      batchSize: config.batchSize,
-      batchDelayMs: config.batchDelayMs,
-    })))
-  })
-
-  app.get('/media/:id', (req, res) => {
-    sendPostFile(config.dataDir, db, intParam(req.params.id), 'media', res)
-  })
-
-  app.get('/media/:id/thumb', (req, res) => {
-    sendPostFile(config.dataDir, db, intParam(req.params.id), 'thumb', res)
   })
 
   app.get('/status', (req, res) => {
@@ -463,23 +430,15 @@ export function createApp(deps: Deps): express.Express {
       return
     }
     let mediaPath: string | null = null
-    let thumbPath: string | null = null
-    let mediaWidth: number | null = null
-    let mediaHeight: number | null = null
     try {
       if (temp && kind !== 'text') {
-        const prepared = await prepareStatusMedia({
+        mediaPath = await prepareStatusMedia({
           kind,
           sourcePath: temp.path,
           dataDir: config.dataDir,
           ffmpegPath: config.ffmpegPath,
           maxVideoSeconds: config.maxVideoSeconds,
         })
-        mediaPath = prepared.path
-        thumbPath = prepared.thumbPath
-        mediaWidth = prepared.width || null
-        mediaHeight = prepared.height || null
-        if (prepared.skippedTranscode) db.addLog('info', 'Видео уже подходит для статуса, перекодирование пропущено', account.id)
       }
     } catch (error) {
       db.addLog('error', error instanceof Error ? error.message : 'ffmpeg', account.id)
@@ -494,9 +453,6 @@ export function createApp(deps: Deps): express.Express {
       body: kind === 'text' ? text : '',
       caption,
       mediaPath,
-      thumbPath,
-      mediaWidth,
-      mediaHeight,
       originalName: temp?.originalname ?? null,
       backgroundColor: kind === 'text' ? hexColor(req.body.background_color) : null,
       font: kind === 'text' ? fontOf(req.body.font) : null,
@@ -515,65 +471,7 @@ export function createApp(deps: Deps): express.Express {
       res.redirect('/status?msg=not_found')
       return
     }
-    const views = db.countViews([post.id]).get(post.id) ?? 0
-    res.type('html').send(page(req, config, `Публикация #${post.id}`, 'status', statusDetailPage(post, db.getAccount(post.accountId), db.listBatches(post.id), csrf(res), views)))
-  })
-
-  app.get('/status/:id/viewers', (req, res) => {
-    const post = db.getPost(intParam(req.params.id))
-    if (!post) {
-      res.redirect('/stories?msg=not_found')
-      return
-    }
-    const source = sourceFilter(q(req.query.source))
-    const tag = q(req.query.tag)
-    const search = q(req.query.q)
-    const pageNo = Math.max(1, num(req.query.page) || 1)
-    const found = db.listViews(post.id, { q: search, tag, source, limit: 50, offset: (pageNo - 1) * 50 })
-    res.type('html').send(page(req, config, 'Просмотры', 'stories', viewersPage({
-      post,
-      items: found.items,
-      total: found.total,
-      page: pageNo,
-      q: search,
-      tag,
-      source,
-      tags: db.listTags(),
-    })))
-  })
-
-  app.get('/status/:id/viewers.csv', (req, res) => {
-    const post = db.getPost(intParam(req.params.id))
-    if (!post) {
-      res.status(404).type('text').send('Не найдено')
-      return
-    }
-    const found = db.listViews(post.id, {
-      q: q(req.query.q),
-      tag: q(req.query.tag),
-      source: sourceFilter(q(req.query.source)),
-      limit: 100_000,
-      offset: 0,
-    })
-    const lines = ['телефон;имя;когда']
-    for (const view of found.items) {
-      lines.push([view.phone, view.name, view.viewedAt].map((cell) => /[;"\n]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell).join(';'))
-    }
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
-    res.setHeader('Content-Disposition', `attachment; filename="prosmotry-${post.id}.csv"`)
-    res.send(`\uFEFF${lines.join('\r\n')}\r\n`)
-  })
-
-  app.post('/status/:id/retry', (req, res) => {
-    const post = db.getPost(intParam(req.params.id))
-    if (!post || (post.status !== 'failed' && post.status !== 'partial')) {
-      res.redirect('/status?msg=not_found')
-      return
-    }
-    db.resetFailedBatches(post.id)
-    db.updatePost(post.id, { status: 'queued', finishedAt: null, notBefore: null, error: null })
-    db.addLog('info', `Повтор публикации #${post.id}`, post.accountId)
-    res.redirect(`/status/${post.id}?msg=queued`)
+    res.type('html').send(page(req, config, `Публикация #${post.id}`, 'status', statusDetailPage(post, db.getAccount(post.accountId), db.listBatches(post.id), csrf(res))))
   })
 
   app.get('/status/:id/progress', (req, res) => {
@@ -652,22 +550,6 @@ export function createApp(deps: Deps): express.Express {
   })
 
   return app
-}
-
-function sendPostFile(dataDir: string, db: AppDb, id: number, kind: 'media' | 'thumb', res: Response): void {
-  const post = db.getPost(id)
-  const target = kind === 'thumb' ? post?.thumbPath : post?.mediaPath
-  if (!post || !target) {
-    res.status(404).end()
-    return
-  }
-  const root = path.resolve(dataDir)
-  const file = path.resolve(target)
-  if (!file.startsWith(root + path.sep) && file !== root) {
-    res.status(404).end()
-    return
-  }
-  res.sendFile(file)
 }
 
 function exportRows(db: AppDb, req: Request) {

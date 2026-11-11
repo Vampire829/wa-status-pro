@@ -17,7 +17,6 @@ import type {
   StatusBatch,
   StatusPost,
 } from '../types.js'
-import { statusExpiresAt } from '../statusLogic.js'
 import { formatMoscow } from '../time.js'
 
 export function esc(value: string | number | null | undefined): string {
@@ -32,7 +31,6 @@ const NAV = [
   ['home', '/', 'Обзор'],
   ['accounts', '/accounts', 'Номера'],
   ['contacts', '/contacts', 'Контакты'],
-  ['stories', '/stories', 'Мои статусы'],
   ['status', '/status', 'Публикации'],
   ['health', '/health', 'Журнал'],
 ] as const
@@ -378,7 +376,7 @@ export function statusFormPage(input: {
     </div>
     <div data-kind="video" class="hidden">
       <p><label><span>Видео</span><input type="file" name="video" accept="video/mp4,video/quicktime,video/webm"></label></p>
-      <p class="hint">Ролик заранее кодируется в H.264 High, до 720×1280, около 2,5 Мбит/с. WhatsApp всё равно пережмёт статус, но так картинка страдает меньше. Уже подходящий файл не перекодируется.</p>
+      <p class="hint">Ролик приводится к MP4 (H.264) и обрезается до лимита из настроек. Для статуса WhatsApp разумно держать до 30 секунд.</p>
     </div>
     <p><label><span>Подпись к медиа</span><input type="text" name="caption" maxlength="1024"></label></p>
     <h3>Кому показать</h3>
@@ -390,7 +388,6 @@ export function statusFormPage(input: {
     <p><label><span>Метка, если нужна</span><input name="tag" list="tag-list" placeholder="пусто — без фильтра по метке"></label></p>
     <datalist id="tag-list">${tags}</datalist>
     <p id="audience-count" class="hint">Считаем аудиторию…</p>
-    <p id="publish-cooldown" class="hint" hidden></p>
     <p class="hint">Аудитория считается в момент отправки. «Только чаты WhatsApp» включает и тех, у кого дополнительно есть телефонная книга.</p>
     <h3>Когда</h3>
     <p>
@@ -398,8 +395,7 @@ export function statusFormPage(input: {
       <label><input type="radio" name="when" value="schedule"> Запланировать</label>
     </p>
     <p id="schedule-field" class="hidden"><label><span>Московское время</span><input type="datetime-local" name="scheduled_at"></label></p>
-    <div id="story-preview" class="story-card preview"><p>Здесь будет предпросмотр</p></div>
-    <button type="submit">Опубликовать статус</button>
+    <button type="submit">Опубликовать</button>
   </form>`
 }
 
@@ -420,7 +416,7 @@ export function statusListPage(posts: StatusPost[], accounts: Map<string, Accoun
   </div>`
 }
 
-export function statusDetailPage(post: StatusPost, account: Account | null, batches: StatusBatch[], csrf: string, views = 0): string {
+export function statusDetailPage(post: StatusPost, account: Account | null, batches: StatusBatch[], csrf: string): string {
   const done = ['done', 'partial', 'failed', 'cancelled'].includes(post.status)
   const percent = post.totalRecipients ? Math.round(((post.successRecipients + post.failedRecipients) / post.totalRecipients) * 100) : 0
   const rows = batches.map((batch) => `<tr>
@@ -433,18 +429,12 @@ export function statusDetailPage(post: StatusPost, account: Account | null, batc
   const cancel = post.status === 'queued' || post.status === 'scheduled' || post.status === 'running'
     ? `<form method="post" action="/status/${post.id}/cancel"><input type="hidden" name="csrf" value="${esc(csrf)}"><button class="ghost" type="submit">Остановить</button></form>`
     : ''
-  const retry = post.status === 'failed' || post.status === 'partial'
-    ? `<form method="post" action="/status/${post.id}/retry"><input type="hidden" name="csrf" value="${esc(csrf)}"><button type="submit">Повторить</button></form>`
-    : ''
-  const until = post.notBefore && new Date(post.notBefore).getTime() > Date.now() ? post.notBefore : ''
   return `<h1>Публикация #${post.id}</h1>
   <div id="progress-root" data-url="/status/${post.id}/progress" data-finished="${done ? '1' : '0'}">
     <p id="progress-label">${badge(post.status, POST_STATUS_RU[post.status])}</p>
     <p id="progress-counts">${post.successRecipients} из ${post.totalRecipients}, пачек ${post.sentBatches} из ${post.totalBatches}</p>
     <div class="bar"><span id="progress-fill" style="width:${percent}%"></span></div>
     ${post.error ? `<p class="muted">${esc(post.error)}</p>` : ''}
-    ${until ? `<p id="publish-cooldown" data-until="${esc(until)}">Пауза до ${esc(formatMoscow(until))}</p>` : ''}
-    <p><a href="/status/${post.id}/viewers">👁 ${views}</a></p>
   </div>
   <div class="panel">
     <p>Номер: ${esc(account?.label || 'Удалённый номер')}</p>
@@ -454,102 +444,9 @@ export function statusDetailPage(post: StatusPost, account: Account | null, batc
     ${post.body ? `<p>Текст: ${esc(post.body)}</p>` : ''}
     ${post.caption ? `<p>Подпись: ${esc(post.caption)}</p>` : ''}
     ${post.originalName ? `<p>Файл: ${esc(post.originalName)}</p>` : ''}
-    <p class="row">${cancel}${retry}</p>
+    ${cancel}
   </div>
   ${rows ? `<div class="panel"><table><tr><th>Пачка</th><th>Номеров</th><th>Статус</th><th>Ошибка</th><th>Время</th></tr>${rows}</table></div>` : ''}`
-}
-
-export function storiesPage(input: {
-  posts: StatusPost[]
-  accounts: Map<string, Account>
-  views: Map<number, number>
-  tags: { tag: string; count: number }[]
-  csrf: string
-  batchSize: number
-  batchDelayMs: number
-}): string {
-  const cards = input.posts.map((post) => {
-    const expires = statusExpiresAt(post.finishedAt || post.createdAt)
-    const live = expires ? new Date(expires).getTime() > Date.now() : false
-    const initial = (input.accounts.get(post.accountId)?.label || 'WA').slice(0, 1)
-    const thumb = post.thumbPath ? `/media/${post.id}/thumb` : ''
-    return `<button type="button" class="story-ring ${live ? '' : 'expired'}" data-open-story="${post.id}">
-      <span class="ring-face">${thumb ? `<img src="${esc(thumb)}" alt="">` : esc(initial)}</span>
-      <small>${esc(formatMoscow(post.finishedAt || post.createdAt))}</small>
-    </button>`
-  }).join('')
-  const data = input.posts.map((post) => ({
-    id: post.id,
-    kind: post.kind,
-    text: post.body,
-    caption: post.caption,
-    color: post.backgroundColor || '#0e6b52',
-    mediaUrl: post.mediaPath ? `/media/${post.id}` : '',
-    posted: formatMoscow(post.finishedAt || post.createdAt),
-    expires: statusExpiresAt(post.finishedAt || post.createdAt),
-    views: input.views.get(post.id) ?? 0,
-    label: input.accounts.get(post.accountId)?.label || 'Номер',
-  }))
-  return `<h1>Мои статусы</h1>
-  <p class="lead">Лента как в WhatsApp: кольцо, полноэкранный просмотр и сколько человек открыли статус. На вашем телефоне статус виден, потому что ваш номер есть в каждом списке зрителей.</p>
-  <div class="story-row">${cards || '<p>Опубликованных статусов пока нет.</p>'}</div>
-  <div id="story-stage" class="story-stage hidden" hidden>
-    <button type="button" class="story-close" id="story-close">Закрыть</button>
-    <article class="story-card" id="story-card"></article>
-  </div>
-  ${jsonScript('story-data', data)}
-  <h2>Опубликовать статус</h2>
-  ${composerHtml({ accounts: [...input.accounts.values()], tags: input.tags, csrf: input.csrf, batchSize: input.batchSize, batchDelayMs: input.batchDelayMs })}`
-}
-
-function composerHtml(input: { accounts: Account[]; tags: { tag: string; count: number }[]; csrf: string; batchSize: number; batchDelayMs: number }): string {
-  const html = statusFormPage({ accounts: input.accounts, tags: input.tags, csrf: input.csrf, batchSize: input.batchSize, batchDelayMs: input.batchDelayMs })
-  const formAt = html.indexOf('<form')
-  return formAt >= 0 ? html.slice(formAt) : html
-}
-
-export function viewersPage(input: {
-  post: StatusPost
-  items: { phone: string; name: string; viewedAt: string }[]
-  total: number
-  page: number
-  q: string
-  tag: string
-  source: SourceFilter
-  tags: { tag: string; count: number }[]
-}): string {
-  const params = new URLSearchParams()
-  if (input.q) params.set('q', input.q)
-  if (input.tag) params.set('tag', input.tag)
-  if (input.source !== 'all') params.set('source', input.source)
-  const query = params.toString()
-  const options = (['all', 'whatsapp', 'phone', 'both'] as SourceFilter[]).map((source) =>
-    `<option value="${source}" ${source === input.source ? 'selected' : ''}>${esc(SOURCE_FILTER_RU[source])}</option>`).join('')
-  const rows = input.items.map((item) => `<tr>
-    <td>${esc(item.name || '—')}</td>
-    <td>${esc(formatRuPhone(item.phone))}</td>
-    <td>${esc(formatMoscow(item.viewedAt))}</td>
-  </tr>`).join('')
-  const pages = Math.max(1, Math.ceil(input.total / 50))
-  return `<h1>Кто смотрел #${input.post.id}</h1>
-  <p class="lead">👁 ${input.total}. Список новее сверху. WhatsApp присылает квитанцию только если у человека включены отчёты о прочтении, поэтому цифра может быть меньше, чем в приложении.</p>
-  <form class="row" method="get" action="/status/${input.post.id}/viewers">
-    <label><span>Поиск</span><input type="search" name="q" value="${esc(input.q)}"></label>
-    <label><span>Метка</span><input name="tag" value="${esc(input.tag)}" list="tag-list"></label>
-    <datalist id="tag-list">${input.tags.map((tag) => `<option value="${esc(tag.tag)}">`).join('')}</datalist>
-    <label><span>Источник</span><select name="source">${options}</select></label>
-    <button class="ghost" type="submit">Фильтр</button>
-    <a class="btn ghost" href="/status/${input.post.id}/viewers.csv?${query}">CSV</a>
-  </form>
-  <div class="panel">
-    ${rows ? `<table><tr><th>Имя</th><th>Телефон</th><th>Когда</th></tr>${rows}</table>` : '<p>Просмотров с квитанцией пока нет.</p>'}
-    <p class="muted">Страница ${input.page} из ${pages}.</p>
-  </div>
-  <p><a href="/stories">К статусам</a></p>`
-}
-
-function jsonScript(id: string, data: unknown): string {
-  return `<script type="application/json" id="${id}">${JSON.stringify(data).replace(/</g, '\\u003c')}</script>`
 }
 
 export function healthPage(input: {

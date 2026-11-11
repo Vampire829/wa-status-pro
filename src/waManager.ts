@@ -19,7 +19,6 @@ import type { AppDb } from './db.js'
 import { WaSendError } from './errors.js'
 import { createProxyAgent, probeWhatsApp, redactProxyMessage, type ProxyProbe } from './proxy.js'
 import { planReconnect } from './reconnect.js'
-import { normalizeOwnJid, viewFromReceipt } from './statusLogic.js'
 import type { AccountStatus } from './types.js'
 import { sleep } from './time.js'
 
@@ -62,8 +61,8 @@ export type SyncResult =
 
 export type StatusContent =
   | { kind: 'text'; text: string; backgroundColor: string; font: number }
-  | { kind: 'image'; filePath: string; caption: string; jpegThumbnail?: string; width?: number; height?: number }
-  | { kind: 'video'; filePath: string; caption: string; jpegThumbnail?: string; width?: number; height?: number }
+  | { kind: 'image'; filePath: string; caption: string }
+  | { kind: 'video'; filePath: string; caption: string }
 
 export class WaManager {
   private readonly sessions = new Map<string, Session>()
@@ -155,7 +154,7 @@ export class WaManager {
             }
           : {}),
         getMessage: async () => undefined,
-        shouldIgnoreJid: (jid) => jid.endsWith('@g.us') || jid.endsWith('@newsletter'),
+        shouldIgnoreJid: (jid) => jid.endsWith('@g.us') || jid.endsWith('@newsletter') || jid === 'status@broadcast',
       })
       if (session.generation !== generation) {
         sock.end(undefined)
@@ -164,26 +163,6 @@ export class WaManager {
       session.sock = sock
       sock.ev.on('creds.update', saveCreds)
       this.bindContacts(accountId, generation, sock)
-      sock.ev.on('message-receipt.update', (updates) => {
-        for (const update of updates) this.rememberView(accountId, {
-          remoteJid: update.key.remoteJid,
-          messageId: update.key.id,
-          userJid: update.receipt.userJid,
-          readTimestamp: update.receipt.readTimestamp,
-          playedTimestamp: 'playedTimestamp' in update.receipt ? Number(update.receipt.playedTimestamp) : null,
-        })
-      })
-      sock.ev.on('messages.update', (updates) => {
-        for (const update of updates) {
-          const status = typeof update.update.status === 'number' ? update.update.status : null
-          this.rememberView(accountId, {
-            remoteJid: update.key.remoteJid,
-            messageId: update.key.id,
-            userJid: update.key.participant,
-            status,
-          })
-        }
-      })
       sock.ev.on('connection.update', (update) => {
         if (session.generation !== generation) return
         session.updates = session.updates
@@ -240,14 +219,6 @@ export class WaManager {
     }
   }
 
-  ownJid(accountId: string): string | null {
-    const session = this.sessions.get(accountId)
-    const fromSocket = normalizeOwnJid(session?.sock?.user?.id)
-    if (fromSocket) return fromSocket
-    const phone = session?.phone ?? this.db.getAccount(accountId)?.phone
-    return phone ? `${phone.replace(/\D/g, '')}@s.whatsapp.net` : null
-  }
-
   isReady(accountId: string): boolean {
     return this.sessions.get(accountId)?.state === 'connected'
   }
@@ -278,18 +249,13 @@ export class WaManager {
       throw new WaSendError('Номер не подключён', { pause: true })
     }
     try {
-      const own = this.ownJid(accountId)
-      const statusJidList = own && !jids.includes(own) ? [own, ...jids] : jids
       const result = await session.sock.sendMessage('status@broadcast', contentPayload(content), {
-        statusJidList,
+        statusJidList: jids,
         broadcast: true,
         backgroundColor: content.kind === 'text' ? content.backgroundColor : undefined,
         font: content.kind === 'text' ? content.font : undefined,
       })
-      const messageId = result?.key.id ?? null
-      if (!messageId) throw new WaSendError('WhatsApp не подтвердил публикацию статуса')
-      this.log('info', `Статус отправлен, id ${messageId}, в списке ${statusJidList.length} jid`, accountId)
-      return { messageId }
+      return { messageId: result?.key.id ?? null }
     } catch (error) {
       const code = statusCodeOf(error)
       if (code === DisconnectReason.loggedOut || code === DisconnectReason.forbidden) {
@@ -395,24 +361,6 @@ export class WaManager {
     })
   }
 
-  private rememberView(accountId: string, input: { remoteJid?: string | null; messageId?: string | null; userJid?: string | null; readTimestamp?: number | Long | null; playedTimestamp?: number | null; status?: number | null }): void {
-    const readTimestamp = typeof input.readTimestamp === 'number' ? input.readTimestamp : input.readTimestamp ? Number(input.readTimestamp) : null
-    const event = viewFromReceipt({ ...input, readTimestamp })
-    if (!event) return
-    const self = this.ownJid(accountId)
-    if (self && event.viewerJid === self) return
-    const postId = this.db.findPostByMessage(event.messageId)
-    if (!postId) return
-    const phone = event.viewerJid.split('@')[0] ?? ''
-    this.db.recordStatusView({
-      postId,
-      viewerJid: event.viewerJid,
-      phone,
-      name: this.db.contactNameByPhone(phone),
-      viewedAt: event.viewedAt,
-    })
-  }
-
   private ingest(accountId: string, peers: WaPeerInput[]): void {
     const account = this.db.getAccount(accountId)
     const extracted = extractWhatsAppPeers(peers, this.db.lidPhoneMap(accountId), account?.phone)
@@ -510,22 +458,13 @@ export class WaManager {
   }
 }
 
-function contentPayload(content: StatusContent):
-  | { text: string }
-  | { image: { url: string }; caption?: string; mimetype: string; jpegThumbnail?: string; width?: number; height?: number }
-  | { video: { url: string }; caption?: string; mimetype: string; jpegThumbnail?: string; width?: number; height?: number } {
+function contentPayload(content: StatusContent): { text: string } | { image: { url: string }; caption?: string; mimetype: string } | { video: { url: string }; caption?: string; mimetype: string } {
   if (content.kind === 'text') return { text: content.text }
-  const shared = {
-    caption: content.caption || undefined,
-    jpegThumbnail: content.jpegThumbnail,
-    width: content.width || undefined,
-    height: content.height || undefined,
+  if (content.kind === 'image') {
+    return { image: { url: content.filePath }, caption: content.caption || undefined, mimetype: 'image/jpeg' }
   }
-  if (content.kind === 'image') return { image: { url: content.filePath }, mimetype: 'image/jpeg', ...shared }
-  return { video: { url: content.filePath }, mimetype: 'video/mp4', ...shared }
+  return { video: { url: content.filePath }, caption: content.caption || undefined, mimetype: 'video/mp4' }
 }
-
-type Long = { toNumber?: () => number; toString: () => string }
 
 function statusCodeOf(error: unknown): number | undefined {
   if (!error || typeof error !== 'object') return undefined

@@ -346,7 +346,11 @@ export function createApp(deps: Deps): express.Express {
   })
 
   app.get('/stories', (req, res) => {
-    const posts = db.listPosts(40).filter((post) => post.status === 'done' || post.status === 'partial')
+    const showDeleted = q(req.query.deleted) === '1'
+    const posts = db.listPosts(60).filter((post) => {
+      if (post.deletedAt) return showDeleted
+      return post.status === 'done' || post.status === 'partial' || post.status === 'queued' || post.status === 'scheduled' || post.status === 'running'
+    })
     const counts = db.countViews(posts.map((post) => post.id))
     const accounts = new Map(db.listAccounts().map((account) => [account.id, account]))
     res.type('html').send(page(req, config, 'Мои статусы', 'stories', storiesPage({
@@ -357,6 +361,8 @@ export function createApp(deps: Deps): express.Express {
       csrf: csrf(res),
       batchSize: config.batchSize,
       batchDelayMs: config.batchDelayMs,
+      showDeleted,
+      failedRevokes: new Map(posts.map((post) => [post.id, db.listBatches(post.id).some((batch) => batch.revokeStatus === 'failed')])),
     })))
   })
 
@@ -574,6 +580,25 @@ export function createApp(deps: Deps): express.Express {
     db.updatePost(post.id, { status: 'queued', finishedAt: null, notBefore: null, error: null })
     db.addLog('info', `Повтор публикации #${post.id}`, post.accountId)
     res.redirect(`/status/${post.id}?msg=queued`)
+  })
+
+  app.post('/status/:id/delete', (req, res) => {
+    const id = intParam(req.params.id)
+    if (db.requestDelete(id, new Date().toISOString()) === 'missing') {
+      res.redirect('/stories?msg=not_found')
+      return
+    }
+    db.addLog('info', `Запрошено удаление статуса #${id}`)
+    res.redirect('/stories?msg=delete_queued')
+  })
+
+  app.post('/status/:id/revoke-retry', (req, res) => {
+    const id = intParam(req.params.id)
+    if (!db.retryRevoke(id)) {
+      res.redirect(`/status/${id}?msg=not_found`)
+      return
+    }
+    res.redirect(`/status/${id}?msg=delete_queued`)
   })
 
   app.get('/status/:id/progress', (req, res) => {

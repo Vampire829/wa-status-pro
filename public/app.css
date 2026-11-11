@@ -98,6 +98,8 @@ th { color: var(--muted); font-weight: 600; font-size: 0.85rem; }
 .footer-note { margin-top: 2rem; color: var(--muted); font-size: 0.88rem; }
 .hidden { display: none; }
 .story-row { display: flex; gap: 0.8rem; overflow-x: auto; padding: 0.6rem 0 1rem; }
+.story-item { display: grid; justify-items: center; gap: 0.25rem; }
+.story-item.deleted { opacity: 0.55; }
 .story-ring { background: transparent; color: inherit; border: 0; padding: 0; width: 84px; cursor: pointer; }
 .story-ring .ring-face {
   width: 68px; height: 68px; margin: 0 auto 0.3rem; border-radius: 50%;

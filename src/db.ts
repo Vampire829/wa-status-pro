@@ -29,8 +29,10 @@ type PostPatch = Partial<{
   startedAt: string | null
   finishedAt: string | null
   thumbPath: string | null
+  mediaPath: string | null
   mediaWidth: number | null
   mediaHeight: number | null
+  deletedAt: string | null
   totalRecipients: number
   totalBatches: number
   sentBatches: number
@@ -302,9 +304,79 @@ export class AppDb {
     return row ? mapPost(row) : null
   }
 
-  listPosts(limit: number): StatusPost[] {
-    const rows = this.raw.prepare('SELECT * FROM status_posts ORDER BY id DESC LIMIT ?').all(limit) as PostRow[]
+  listPosts(limit: number, includeDeleted = true): StatusPost[] {
+    const where = includeDeleted ? '' : 'WHERE deleted_at IS NULL'
+    const rows = this.raw.prepare(`SELECT * FROM status_posts ${where} ORDER BY id DESC LIMIT ?`).all(limit) as PostRow[]
     return rows.map(mapPost)
+  }
+
+  requestDelete(id: number, now: string): 'missing' | 'ok' {
+    const post = this.getPost(id)
+    if (!post) return 'missing'
+    const cancellable = post.status === 'queued' || post.status === 'scheduled' || post.status === 'running'
+    this.updatePost(id, {
+      deletedAt: post.deletedAt ?? now,
+      ...(cancellable
+        ? { status: 'cancelled' as const, finishedAt: post.finishedAt ?? now, error: 'Остановлено перед удалением' }
+        : {}),
+    })
+    this.raw.prepare(
+      `UPDATE status_batches
+       SET revoke_status = 'pending', revoke_error = NULL
+       WHERE post_id = ? AND status = 'sent' AND wa_message_id IS NOT NULL
+         AND (revoke_status IS NULL OR revoke_status = 'failed')`,
+    ).run(id)
+    return 'ok'
+  }
+
+  retryRevoke(id: number): boolean {
+    const post = this.getPost(id)
+    if (!post?.deletedAt) return false
+    const info = this.raw.prepare(
+      `UPDATE status_batches SET revoke_status = 'pending', revoke_error = NULL
+       WHERE post_id = ? AND revoke_status = 'failed'`,
+    ).run(id)
+    if (info.changes > 0) this.updatePost(id, { notBefore: null, error: null })
+    return info.changes > 0
+  }
+
+  nextMediaCleanup(): number | null {
+    const row = this.raw.prepare(
+      `SELECT id FROM status_posts
+       WHERE deleted_at IS NOT NULL
+         AND status != 'running'
+         AND (media_path IS NOT NULL OR thumb_path IS NOT NULL)
+         AND NOT EXISTS (
+           SELECT 1 FROM status_batches
+           WHERE post_id = status_posts.id AND revoke_status = 'pending'
+         )
+       ORDER BY id ASC LIMIT 1`,
+    ).get() as { id: number } | undefined
+    return row?.id ?? null
+  }
+
+  nextDeletion(now: string): number | null {
+    const row = this.raw.prepare(
+      `SELECT id FROM status_posts
+       WHERE deleted_at IS NOT NULL
+         AND status != 'running'
+         AND (not_before IS NULL OR not_before <= ?)
+         AND EXISTS (
+           SELECT 1 FROM status_batches
+           WHERE post_id = status_posts.id AND revoke_status = 'pending'
+         )
+       ORDER BY deleted_at ASC, id ASC
+       LIMIT 1`,
+    ).get(now) as { id: number } | undefined
+    return row?.id ?? null
+  }
+
+  pendingRevokes(postId: number): StatusBatch[] {
+    return this.listBatches(postId).filter((batch) => batch.revokeStatus === 'pending' && batch.waMessageId)
+  }
+
+  markRevoke(id: number, status: 'revoked' | 'failed' | 'pending', error: string | null): void {
+    this.raw.prepare('UPDATE status_batches SET revoke_status = ?, revoke_error = ? WHERE id = ?').run(status, error, id)
   }
 
   claimNextPost(now: string): number | null {
@@ -331,7 +403,7 @@ export class AppDb {
     this.raw.prepare(
       `UPDATE status_posts SET
         status = ?, not_before = ?, error = ?, started_at = ?, finished_at = ?,
-        thumb_path = ?, media_width = ?, media_height = ?,
+        media_path = ?, thumb_path = ?, media_width = ?, media_height = ?, deleted_at = ?,
         total_recipients = ?, total_batches = ?, sent_batches = ?, success_recipients = ?, failed_recipients = ?
        WHERE id = ?`,
     ).run(
@@ -340,9 +412,11 @@ export class AppDb {
       next.error,
       next.startedAt,
       next.finishedAt,
+      next.mediaPath,
       next.thumbPath,
       next.mediaWidth,
       next.mediaHeight,
+      next.deletedAt,
       next.totalRecipients,
       next.totalBatches,
       next.sentBatches,
@@ -736,7 +810,8 @@ export function openDatabase(file: string): AppDb {
       error TEXT,
       created_at TEXT NOT NULL,
       started_at TEXT,
-      finished_at TEXT
+      finished_at TEXT,
+      deleted_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_posts_status ON status_posts(status, scheduled_at);
     CREATE TABLE IF NOT EXISTS status_batches (
@@ -749,6 +824,8 @@ export function openDatabase(file: string): AppDb {
       error TEXT,
       wa_message_id TEXT,
       sent_at TEXT,
+      revoke_status TEXT,
+      revoke_error TEXT,
       UNIQUE(post_id, batch_index)
     );
     CREATE TABLE IF NOT EXISTS status_views (
@@ -782,6 +859,9 @@ export function openDatabase(file: string): AppDb {
   ensureColumn(raw, 'status_posts', 'thumb_path', 'TEXT')
   ensureColumn(raw, 'status_posts', 'media_width', 'INTEGER')
   ensureColumn(raw, 'status_posts', 'media_height', 'INTEGER')
+  ensureColumn(raw, 'status_posts', 'deleted_at', 'TEXT')
+  ensureColumn(raw, 'status_batches', 'revoke_status', 'TEXT')
+  ensureColumn(raw, 'status_batches', 'revoke_error', 'TEXT')
   return new AppDb(raw)
 }
 
@@ -840,6 +920,7 @@ type PostRow = {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  deleted_at: string | null
 }
 
 type BatchRow = {
@@ -852,6 +933,8 @@ type BatchRow = {
   error: string | null
   wa_message_id: string | null
   sent_at: string | null
+  revoke_status: 'pending' | 'revoked' | 'failed' | null
+  revoke_error: string | null
 }
 
 type ImportRunRow = {
@@ -916,6 +999,7 @@ function mapPost(row: PostRow): StatusPost {
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    deletedAt: row.deleted_at,
   }
 }
 
@@ -937,5 +1021,7 @@ function mapBatch(row: BatchRow): StatusBatch {
     error: row.error,
     waMessageId: row.wa_message_id,
     sentAt: row.sent_at,
+    revokeStatus: row.revoke_status,
+    revokeError: row.revoke_error,
   }
 }

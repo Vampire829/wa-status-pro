@@ -225,12 +225,22 @@ if (storyDataNode && stage instanceof HTMLElement && card instanceof HTMLElement
     const left = expires ? Math.max(0, expires - Date.now()) : 0
     const hours = Math.floor(left / 3600000)
     const minutes = Math.floor((left % 3600000) / 60000)
-    meta.textContent = `${story.posted}. ${left > 0 ? `Исчезнет через ${hours} ч ${minutes} мин` : '24 часа прошли'}. 👁 ${story.views}`
+    meta.textContent = story.deleted
+      ? `${story.posted}. Удалён. 👁 ${story.views}`
+      : `${story.posted}. ${left > 0 ? `Исчезнет через ${hours} ч ${minutes} мин` : '24 часа прошли'}. 👁 ${story.views}`
     const link = document.createElement('a')
     link.href = `/status/${story.id}/viewers`
     link.textContent = 'Кто смотрел'
     link.style.color = 'white'
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.className = 'danger'
+    remove.textContent = 'Удалить'
+    remove.addEventListener('click', () => {
+      document.getElementById(`delete-story-${story.id}`)?.requestSubmit()
+    })
     copy.append(title, meta, link)
+    if (!story.deleted) copy.append(remove)
     if (story.caption) {
       const caption = document.createElement('p')
       caption.textContent = story.caption

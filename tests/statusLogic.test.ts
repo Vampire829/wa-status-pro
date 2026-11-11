@@ -5,6 +5,7 @@ import { openDatabase } from '../src/db.js'
 import {
   cooldownRemainingMs,
   normalizeOwnJid,
+  statusDeleteKey,
   videoNeedsTranscode,
   viewFromReceipt,
   withOwnJid,
@@ -43,6 +44,29 @@ test('просмотр считается только по квитанции r
   assert.equal(view?.viewerJid, '79280000001@s.whatsapp.net')
   assert.equal(view?.messageId, 'abc')
   assert.equal(viewFromReceipt({ remoteJid: 'status@broadcast', messageId: 'abc', userJid: '79280000001@s.whatsapp.net' }), null)
+})
+
+test('удаление прячет статус, сохраняет просмотры и помечает пачки к отзыву', () => {
+  const db = openDatabase(':memory:')
+  const account = db.createAccount('Тест')
+  const post = db.createPost({
+    accountId: account.id, kind: 'text', body: 'привет', caption: '', mediaPath: '/data/media/a.jpg', originalName: null,
+    backgroundColor: '#111111', font: 0, audienceSource: 'any', audienceTag: null, scheduledAt: null, status: 'done',
+  })
+  db.insertBatches(post.id, [['79990000000@s.whatsapp.net', '79280000001@s.whatsapp.net']], '79990000000@s.whatsapp.net')
+  const batch = db.listBatches(post.id)[0]
+  assert.ok(batch)
+  db.markBatch(batch.id, { status: 'sent', waMessageId: 'MSG9' })
+  db.recordStatusView({ postId: post.id, viewerJid: '79280000001@s.whatsapp.net', phone: '79280000001', name: 'Аминат', viewedAt: '2026-01-01T00:00:00.000Z' })
+  assert.equal(db.requestDelete(post.id, '2026-01-02T00:00:00.000Z'), 'ok')
+  assert.equal(db.listPosts(10, false).some((item) => item.id === post.id), false)
+  assert.equal(db.listViews(post.id, { q: '', tag: '', source: 'all', limit: 10, offset: 0 }).total, 1)
+  assert.equal(db.pendingRevokes(post.id)[0]?.waMessageId, 'MSG9')
+  db.markRevoke(batch.id, 'failed', 'сеть')
+  assert.equal(db.retryRevoke(post.id), true)
+  assert.equal(db.pendingRevokes(post.id).length, 1)
+  assert.deepEqual(statusDeleteKey('MSG9'), { remoteJid: 'status@broadcast', fromMe: true, id: 'MSG9' })
+  db.close()
 })
 
 test('просмотр пишется один раз и находится по id сообщения', () => {

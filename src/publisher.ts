@@ -11,7 +11,8 @@ import type { StatusContent, WaManager } from './waManager.js'
 
 export type PublisherDeps = {
   db: AppDb
-  wa: Pick<WaManager, 'isReady' | 'isBlocked' | 'sendStatus' | 'ownJid'>
+  wa: Pick<WaManager, 'isReady' | 'isBlocked' | 'sendStatus' | 'ownJid' | 'deleteStatus'>
+  removeMedia?: (post: StatusPost) => void
   batchSize: number
   batchDelayMs: number
   minPublishIntervalMs: number
@@ -26,7 +27,8 @@ export function startScheduler(deps: PublisherDeps, intervalMs = 2000): { stop: 
   const timer = setInterval(() => {
     if (stopped || running) return
     running = true
-    publishOnce(deps)
+    revokeOnce(deps)
+      .then((revoked) => (revoked ? false : publishOnce(deps)))
       .catch((error) => {
         const text = error instanceof Error ? error.message : String(error)
         deps.log?.('error', `Планировщик: ${text}`)
@@ -157,6 +159,8 @@ async function runPost(deps: PublisherDeps, post: StatusPost, now: Date): Promis
     if (pendingLeft) await sleep(deps.batchDelayMs)
   }
 
+  const latest = deps.db.getPost(post.id)
+  if (latest?.deletedAt || latest?.status === 'cancelled') return
   const agg = deps.db.aggregateBatches(post.id)
   let status: StatusPost['status'] = 'done'
   let error: string | null = null
@@ -177,6 +181,58 @@ async function runPost(deps: PublisherDeps, post: StatusPost, now: Date): Promis
     totalBatches: agg.total,
   })
   deps.log?.(status === 'done' ? 'info' : 'warn', `Публикация #${post.id}: ${status === 'done' ? 'готово' : error}`, post.accountId)
+}
+
+export async function revokeOnce(deps: PublisherDeps): Promise<boolean> {
+  const now = (deps.now ?? (() => new Date()))()
+  const stamp = nowIso(now)
+  const purgeId = deps.db.nextMediaCleanup()
+  if (purgeId != null) {
+    const stale = deps.db.getPost(purgeId)
+    if (stale) deps.removeMedia?.(stale)
+    return true
+  }
+  const id = deps.db.nextDeletion(stamp)
+  if (id == null) {
+    return false
+  }
+  const post = deps.db.getPost(id)
+  if (!post) return false
+  if (!deps.wa.isReady(post.accountId)) {
+    deps.db.updatePost(post.id, { notBefore: new Date(now.getTime() + 20_000).toISOString(), error: 'Удаление ждёт подключения номера' })
+    return false
+  }
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const pending = deps.db.pendingRevokes(post.id)
+  for (let index = 0; index < pending.length; index += 1) {
+    const batch = pending[index]
+    if (!batch?.waMessageId) continue
+    try {
+      await withTimeout(deps.wa.deleteStatus(post.accountId, batch.waMessageId, batch.jids), 90_000)
+      deps.db.markRevoke(batch.id, 'revoked', null)
+      deps.log?.('info', `Статус #${post.id}, пачка ${batch.batchIndex + 1} отозвана, id ${batch.waMessageId}`, post.accountId)
+    } catch (error) {
+      if (error instanceof WaSendError && error.pause) {
+        deps.db.updatePost(post.id, { notBefore: new Date(now.getTime() + 20_000).toISOString(), error: 'Удаление прервалось: номер не на связи' })
+        return true
+      }
+      const text = clip(error instanceof Error ? error.message : 'Не удалось отозвать пачку')
+      deps.db.markRevoke(batch.id, 'failed', text)
+      deps.log?.('error', `Статус #${post.id}, пачка ${batch.batchIndex + 1} не отозвана: ${text}`, post.accountId)
+    }
+    if (index < pending.length - 1) await sleep(deps.batchDelayMs)
+  }
+  const left = deps.db.pendingRevokes(post.id)
+  if (left.length === 0) {
+    const failed = deps.db.listBatches(post.id).filter((batch) => batch.revokeStatus === 'failed')
+    deps.db.updatePost(post.id, {
+      error: failed.length > 0 ? `Не отозвано пачек: ${failed.length}. Можно повторить.` : null,
+      notBefore: null,
+    })
+    deps.removeMedia?.(deps.db.getPost(post.id) ?? post)
+    deps.log?.(failed.length ? 'warn' : 'info', failed.length ? `Удаление #${post.id} частичное` : `Статус #${post.id} удалён у получателей`, post.accountId)
+  }
+  return true
 }
 
 function contentOf(post: StatusPost): StatusContent {

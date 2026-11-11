@@ -1,13 +1,17 @@
+import fs from 'node:fs'
+
 import { planBatches } from './batch.js'
 import type { AppDb } from './db.js'
 import { WaSendError } from './errors.js'
+import { readJpegThumbnail } from './media.js'
+import { audienceCount, cooldownRemainingMs, withOwnJid } from './statusLogic.js'
 import type { StatusPost } from './types.js'
 import { nowIso } from './time.js'
 import type { StatusContent, WaManager } from './waManager.js'
 
 export type PublisherDeps = {
   db: AppDb
-  wa: Pick<WaManager, 'isReady' | 'isBlocked' | 'sendStatus'>
+  wa: Pick<WaManager, 'isReady' | 'isBlocked' | 'sendStatus' | 'ownJid'>
   batchSize: number
   batchDelayMs: number
   minPublishIntervalMs: number
@@ -34,9 +38,14 @@ export function startScheduler(deps: PublisherDeps, intervalMs = 2000): { stop: 
   return { stop() { stopped = true; clearInterval(timer) } }
 }
 
+const SEND_TIMEOUT_MS = 90_000
+const STUCK_AFTER_MS = 8 * 60_000
+
 export async function publishOnce(deps: PublisherDeps): Promise<boolean> {
   const now = (deps.now ?? (() => new Date()))()
   const stamp = nowIso(now)
+  const stuck = deps.db.failStuckRunning(new Date(now.getTime() - STUCK_AFTER_MS).toISOString(), stamp)
+  if (stuck > 0) deps.log?.('warn', `Остановлено зависших публикаций: ${stuck}`)
   const claimed = deps.db.claimNextPost(stamp)
   if (claimed == null) return false
   const post = deps.db.getPost(claimed)
@@ -46,10 +55,11 @@ export async function publishOnce(deps: PublisherDeps): Promise<boolean> {
     if (last) {
       const elapsed = now.getTime() - new Date(last).getTime()
       if (elapsed < deps.minPublishIntervalMs) {
+        const waitMs = cooldownRemainingMs(last, deps.minPublishIntervalMs, now.getTime())
         deps.db.updatePost(post.id, {
           status: 'queued',
           notBefore: new Date(new Date(last).getTime() + deps.minPublishIntervalMs).toISOString(),
-          error: 'Пауза между публикациями, чтобы не частить',
+          error: `Пауза между публикациями, осталось ${Math.ceil(waitMs / 1000)} с`,
         })
         return false
       }
@@ -83,18 +93,21 @@ async function runPost(deps: PublisherDeps, post: StatusPost, now: Date): Promis
     }
     const phones = deps.db.audiencePhones(post.audienceSource, post.audienceTag)
     const jids = phones.map((phone) => `${phone}@s.whatsapp.net`)
-    const chunks = planBatches(jids, deps.batchSize)
+    const own = deps.wa.ownJid(post.accountId)
+    const chunks = withOwnJid(planBatches(jids, deps.batchSize), own)
     if (chunks.length === 0) {
       deps.db.updatePost(post.id, { status: 'failed', finishedAt: nowIso(now), error: 'В выбранной аудитории нет контактов' })
       return
     }
-    deps.db.insertBatches(post.id, chunks)
+    if (!own) deps.log?.('warn', `Публикация #${post.id}: свой номер не добавлен в список, на телефоне статус может не появиться`, post.accountId)
+    deps.db.insertBatches(post.id, chunks, own)
+    const audienceTotal = chunks.reduce((sum, chunk) => sum + audienceCount(chunk, own), 0)
     deps.db.updatePost(post.id, {
-      totalRecipients: chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+      totalRecipients: audienceTotal,
       totalBatches: chunks.length,
       error: null,
     })
-    deps.log?.('info', `Публикация #${post.id}: ${chunks.reduce((s, c) => s + c.length, 0)} получателей, пачек ${chunks.length}`, post.accountId)
+    deps.log?.('info', `Публикация #${post.id}: ${audienceTotal} получателей${own ? ' и ваш номер в каждой пачке' : ''}, пачек ${chunks.length}`, post.accountId)
     batches = deps.db.listBatches(post.id)
   }
 
@@ -110,8 +123,11 @@ async function runPost(deps: PublisherDeps, post: StatusPost, now: Date): Promis
     let lastError = 'Пачка не отправилась'
     for (let attempt = 1; attempt <= 2 && !sent; attempt += 1) {
       try {
-        const result = await deps.wa.sendStatus(post.accountId, contentOf(post), batch.jids)
+        const result = await withTimeout(deps.wa.sendStatus(post.accountId, contentOf(post), batch.jids), SEND_TIMEOUT_MS)
+        if (!result.messageId) throw new WaSendError('WhatsApp не вернул идентификатор статуса')
         deps.db.markBatch(batch.id, { status: 'sent', waMessageId: result.messageId })
+        const own = deps.wa.ownJid(post.accountId)
+        deps.log?.('info', `Публикация #${post.id}, пачка ${batch.batchIndex + 1}: ${audienceCount(batch.jids, own)} получателей${own ? ' и ваш номер' : ''}, id ${result.messageId}`, post.accountId)
         sent = true
       } catch (error) {
         if (error instanceof WaSendError && error.pause) {
@@ -132,7 +148,10 @@ async function runPost(deps: PublisherDeps, post: StatusPost, now: Date): Promis
         if (attempt === 1) await sleep(deps.batchDelayMs)
       }
     }
-    if (!sent) deps.db.markBatch(batch.id, { status: 'failed', error: lastError })
+    if (!sent) {
+      deps.db.markBatch(batch.id, { status: 'failed', error: lastError })
+      deps.log?.('error', `Публикация #${post.id}, пачка ${batch.batchIndex + 1} не ушла: ${lastError}`, post.accountId)
+    }
     refresh(deps, post.id)
     const pendingLeft = deps.db.nextPendingBatch(post.id)
     if (pendingLeft) await sleep(deps.batchDelayMs)
@@ -164,9 +183,19 @@ function contentOf(post: StatusPost): StatusContent {
   if (post.kind === 'text') {
     return { kind: 'text', text: post.body, backgroundColor: post.backgroundColor || '#0E6B52', font: post.font ?? 0 }
   }
-  if (!post.mediaPath) throw new Error('Файл публикации не найден')
-  if (post.kind === 'image') return { kind: 'image', filePath: post.mediaPath, caption: post.caption }
-  return { kind: 'video', filePath: post.mediaPath, caption: post.caption }
+  if (!post.mediaPath || !fs.existsSync(post.mediaPath)) throw new Error('Файл публикации не найден')
+  const jpegThumbnail = readJpegThumbnail(post.thumbPath)
+  if (post.kind === 'image') {
+    return { kind: 'image', filePath: post.mediaPath, caption: post.caption, jpegThumbnail, width: post.mediaWidth ?? undefined, height: post.mediaHeight ?? undefined }
+  }
+  return { kind: 'video', filePath: post.mediaPath, caption: post.caption, jpegThumbnail, width: post.mediaWidth ?? undefined, height: post.mediaHeight ?? undefined }
+}
+
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new WaSendError(`WhatsApp не ответил за ${Math.round(ms / 1000)} с`)), ms)
+    work.then((value) => { clearTimeout(timer); resolve(value) }, (error: unknown) => { clearTimeout(timer); reject(error) })
+  })
 }
 
 function refresh(deps: PublisherDeps, postId: number): void {

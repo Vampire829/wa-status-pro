@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import crypto from 'node:crypto'
 
 import { mergeName, uniqueSources } from './contactsMerge.js'
+import { matchAudience, type AudienceContact, type AudienceSpec } from './statusLogic.js'
 import { foldText, likeContains, normalizeTagList } from './tags.js'
 import type {
   Account,
@@ -33,6 +34,7 @@ type PostPatch = Partial<{
   mediaWidth: number | null
   mediaHeight: number | null
   deletedAt: string | null
+  audienceSpec: string | null
   totalRecipients: number
   totalBatches: number
   sentBatches: number
@@ -234,6 +236,24 @@ export class AppDb {
     return { added, updated, unchanged }
   }
 
+  phonesForSpec(spec: AudienceSpec): string[] {
+    return this.audienceContacts().filter((contact) => matchAudience(contact, spec)).map((contact) => contact.phone)
+  }
+
+  audienceContacts(): AudienceContact[] {
+    const rows = this.raw.prepare('SELECT id, phone FROM contacts ORDER BY id ASC').all() as { id: number; phone: string }[]
+    if (rows.length === 0) return []
+    const ids = rows.map((row) => row.id)
+    const marks = ids.map(() => '?').join(',')
+    const tags = this.raw.prepare(`SELECT contact_id, tag FROM contact_tags WHERE contact_id IN (${marks})`).all(...ids) as { contact_id: number; tag: string }[]
+    const sources = this.raw.prepare(`SELECT contact_id, source FROM contact_sources WHERE contact_id IN (${marks})`).all(...ids) as { contact_id: number; source: 'whatsapp' | 'phone' }[]
+    return rows.map((row) => ({
+      phone: row.phone,
+      tags: tags.filter((tag) => tag.contact_id === row.id).map((tag) => tag.tag),
+      sources: sources.filter((source) => source.contact_id === row.id).map((source) => source.source),
+    }))
+  }
+
   audiencePhones(source: AudienceSource, tag: string | null): string[] {
     const tagFold = tag?.trim() ? foldText(tag) : ''
     const rows = this.raw.prepare(
@@ -269,6 +289,7 @@ export class AppDb {
     font: number | null
     audienceSource: AudienceSource
     audienceTag: string | null
+    audienceSpec?: string | null
     scheduledAt: string | null
     status: PostStatus
   }): StatusPost {
@@ -276,8 +297,8 @@ export class AppDb {
     const info = this.raw.prepare(
       `INSERT INTO status_posts (
         account_id, kind, body, caption, media_path, thumb_path, media_width, media_height, original_name, background_color, font,
-        audience_source, audience_tag, scheduled_at, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        audience_source, audience_tag, audience_spec, scheduled_at, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.accountId,
       input.kind,
@@ -292,6 +313,7 @@ export class AppDb {
       input.font,
       input.audienceSource,
       input.audienceTag,
+      input.audienceSpec ?? null,
       input.scheduledAt,
       input.status,
       now,
@@ -403,7 +425,7 @@ export class AppDb {
     this.raw.prepare(
       `UPDATE status_posts SET
         status = ?, not_before = ?, error = ?, started_at = ?, finished_at = ?,
-        media_path = ?, thumb_path = ?, media_width = ?, media_height = ?, deleted_at = ?,
+        media_path = ?, thumb_path = ?, media_width = ?, media_height = ?, deleted_at = ?, audience_spec = ?,
         total_recipients = ?, total_batches = ?, sent_batches = ?, success_recipients = ?, failed_recipients = ?
        WHERE id = ?`,
     ).run(
@@ -417,6 +439,7 @@ export class AppDb {
       next.mediaWidth,
       next.mediaHeight,
       next.deletedAt,
+      next.audienceSpec,
       next.totalRecipients,
       next.totalBatches,
       next.sentBatches,
@@ -799,6 +822,7 @@ export function openDatabase(file: string): AppDb {
       font INTEGER,
       audience_source TEXT NOT NULL,
       audience_tag TEXT,
+      audience_spec TEXT,
       scheduled_at TEXT,
       not_before TEXT,
       status TEXT NOT NULL,
@@ -860,6 +884,7 @@ export function openDatabase(file: string): AppDb {
   ensureColumn(raw, 'status_posts', 'media_width', 'INTEGER')
   ensureColumn(raw, 'status_posts', 'media_height', 'INTEGER')
   ensureColumn(raw, 'status_posts', 'deleted_at', 'TEXT')
+  ensureColumn(raw, 'status_posts', 'audience_spec', 'TEXT')
   ensureColumn(raw, 'status_batches', 'revoke_status', 'TEXT')
   ensureColumn(raw, 'status_batches', 'revoke_error', 'TEXT')
   return new AppDb(raw)
@@ -908,6 +933,7 @@ type PostRow = {
   font: number | null
   audience_source: AudienceSource
   audience_tag: string | null
+  audience_spec: string | null
   scheduled_at: string | null
   not_before: string | null
   status: PostStatus
@@ -987,6 +1013,7 @@ function mapPost(row: PostRow): StatusPost {
     font: row.font,
     audienceSource: row.audience_source,
     audienceTag: row.audience_tag,
+    audienceSpec: row.audience_spec,
     scheduledAt: row.scheduled_at,
     notBefore: row.not_before,
     status: row.status,

@@ -92,6 +92,86 @@ export function viewFromReceipt(input: ReceiptInput, nowMs = Date.now()): { mess
   return { messageId, viewerJid, viewedAt }
 }
 
+export type AudienceMode = 'all' | 'exclude' | 'only'
+
+export type AudienceSpec = {
+  mode: AudienceMode
+  excludeTags: string[]
+  excludePhones: string[]
+  includeTags: string[]
+  includeSources: Array<'whatsapp' | 'phone'>
+  includePhones: string[]
+}
+
+export type AudienceContact = {
+  phone: string
+  tags: string[]
+  sources: Array<'whatsapp' | 'phone'>
+}
+
+export function emptyAudience(mode: AudienceMode = 'all'): AudienceSpec {
+  return { mode, excludeTags: [], excludePhones: [], includeTags: [], includeSources: [], includePhones: [] }
+}
+
+export function parseAudienceSpec(raw: unknown): AudienceSpec {
+  const source = raw && typeof raw === 'object' ? raw as Partial<AudienceSpec> : {}
+  const mode = source.mode === 'exclude' || source.mode === 'only' ? source.mode : 'all'
+  return {
+    mode,
+    excludeTags: stringList(source.excludeTags),
+    excludePhones: stringList(source.excludePhones).map((phone) => phone.replace(/\D/g, '')),
+    includeTags: stringList(source.includeTags),
+    includeSources: stringList(source.includeSources).filter((item): item is 'whatsapp' | 'phone' => item === 'whatsapp' || item === 'phone'),
+    includePhones: stringList(source.includePhones).map((phone) => phone.replace(/\D/g, '')),
+  }
+}
+
+export function matchAudience(contact: AudienceContact, spec: AudienceSpec): boolean {
+  const tags = new Set(contact.tags.map((tag) => tag.trim().toLocaleLowerCase('ru-RU')))
+  const phones = new Set([contact.phone, contact.phone.replace(/\D/g, '')])
+  if (spec.mode === 'exclude') {
+    if (spec.excludePhones.some((phone) => phones.has(phone))) return false
+    if (spec.excludeTags.some((tag) => tags.has(tag.trim().toLocaleLowerCase('ru-RU')))) return false
+    return true
+  }
+  if (spec.mode === 'only') {
+    if (spec.includePhones.some((phone) => phones.has(phone))) return true
+    if (spec.includeTags.some((tag) => tags.has(tag.trim().toLocaleLowerCase('ru-RU')))) return true
+    if (spec.includeSources.some((source) => contact.sources.includes(source))) return true
+    return false
+  }
+  return true
+}
+
+export function planVideoSegments(duration: number, maxSeconds: number): { start: number; end: number }[] {
+  const max = Math.max(1, maxSeconds)
+  if (!Number.isFinite(duration) || duration <= 0) return [{ start: 0, end: max }]
+  if (duration <= max + 0.05) return [{ start: 0, end: roundSeconds(duration) }]
+  const parts: { start: number; end: number }[] = []
+  for (let start = 0; start < duration - 0.05; start += max) {
+    parts.push({ start: roundSeconds(start), end: roundSeconds(Math.min(duration, start + max)) })
+  }
+  return parts
+}
+
+export function escapeDrawtext(text: string): string {
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/%/g, '\\%')
+    .replace(/\n/g, ' ')
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean).slice(0, 100)
+}
+
+function roundSeconds(value: number): number {
+  return Math.round(value * 10) / 10
+}
+
 export function statusDeleteKey(messageId: string): { remoteJid: 'status@broadcast'; fromMe: true; id: string } {
   return { remoteJid: 'status@broadcast', fromMe: true, id: messageId }
 }

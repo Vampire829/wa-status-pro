@@ -472,6 +472,7 @@ export function storiesPage(input: {
   csrf: string
   batchSize: number
   batchDelayMs: number
+  maxVideoSeconds: number
   showDeleted: boolean
   failedRevokes: Map<number, boolean>
 }): string {
@@ -481,8 +482,8 @@ export function storiesPage(input: {
     const initial = (input.accounts.get(post.accountId)?.label || 'WA').slice(0, 1)
     const thumb = post.thumbPath ? `/media/${post.id}/thumb` : ''
     return `<div class="story-item ${post.deletedAt ? 'deleted' : ''}">
-      <button type="button" class="story-ring ${live ? '' : 'expired'}" data-open-story="${post.id}">
-        <span class="ring-face">${thumb ? `<img src="${esc(thumb)}" alt="">` : esc(initial)}</span>
+      <button type="button" class="story-ring ${live ? '' : 'expired'}" data-open-story="${post.id}" data-status="${esc(post.status)}" data-progress="/status/${post.id}/progress">
+        <span class="ring-face ${post.status === 'queued' || post.status === 'running' ? 'progress' : ''}">${thumb ? `<img src="${esc(thumb)}" alt="">` : esc(initial)}</span>
         <small>${post.deletedAt ? 'Удалён' : esc(formatMoscow(post.finishedAt || post.createdAt))}</small>
       </button>
       ${post.deletedAt
@@ -517,14 +518,13 @@ export function storiesPage(input: {
     <article class="story-card" id="story-card"></article>
   </div>
   ${jsonScript('story-data', data)}
-  <h2>Опубликовать статус</h2>
-  ${composerHtml({ accounts: [...input.accounts.values()], tags: input.tags, csrf: input.csrf, batchSize: input.batchSize, batchDelayMs: input.batchDelayMs })}`
-}
-
-function composerHtml(input: { accounts: Account[]; tags: { tag: string; count: number }[]; csrf: string; batchSize: number; batchDelayMs: number }): string {
-  const html = statusFormPage({ accounts: input.accounts, tags: input.tags, csrf: input.csrf, batchSize: input.batchSize, batchDelayMs: input.batchDelayMs })
-  const formAt = html.indexOf('<form')
-  return formAt >= 0 ? html.slice(formAt) : html
+  <div class="wa-actions">
+    <button type="button" class="wa-plus" id="add-status">＋<span>Статус</span></button>
+    <button type="button" class="wa-text" id="add-text">✎<span>Текст</span></button>
+  </div>
+  <input id="media-files" type="file" accept="image/*,video/*" multiple hidden>
+  <div id="wa-composer" data-csrf="${esc(input.csrf)}" data-max="${input.maxVideoSeconds}" data-accounts="${esc(JSON.stringify([...input.accounts.values()].map((account) => ({ id: account.id, label: account.label }))))}" data-tags="${esc(JSON.stringify(input.tags.map((tag) => tag.tag)))}"></div>
+  <script src="/assets/composer.js"></script>`
 }
 
 export function viewersPage(input: {

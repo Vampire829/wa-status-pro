@@ -74,6 +74,7 @@ export type StatusPost = {
   font: number | null
   audienceSource: AudienceSource
   audienceTag: string | null
+  audienceSpec: string | null
   scheduledAt: string | null
   notBefore: string | null
   status: PostStatus

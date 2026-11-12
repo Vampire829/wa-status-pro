@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { videoNeedsTranscode, type VideoFacts } from './statusLogic.js'
+import { escapeDrawtext, videoNeedsTranscode, type VideoFacts } from './statusLogic.js'
 
 let ffmpegChain: Promise<void> = Promise.resolve()
 
@@ -87,14 +87,33 @@ export type PreparedMedia = {
 
 const BOX = "scale=w='min(720,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
+export type MediaOverlay = { text: string; x: number; y: number }
+
 export async function prepareStatusMedia(opts: {
   kind: 'image' | 'video'
   sourcePath: string
   dataDir: string
   ffmpegPath: string
   maxVideoSeconds: number
+  trimStart?: number
+  trimEnd?: number
+  mute?: boolean
+  overlays?: MediaOverlay[]
+  fontFile?: string
 }): Promise<PreparedMedia> {
   return withFfmpegLock(() => prepareUnlocked(opts))
+}
+
+function overlayFilter(overlays: MediaOverlay[] | undefined, fontFile: string): string {
+  if (!overlays?.length) return ''
+  return overlays.slice(0, 8).map((item) => {
+    const text = item.text.trim().slice(0, 80)
+    if (!text) return ''
+    const x = Math.min(1, Math.max(0, item.x))
+    const y = Math.min(1, Math.max(0, item.y))
+    const size = [...text].length <= 3 ? 78 : 42
+    return `drawtext=fontfile='${fontFile}':text='${escapeDrawtext(text)}':x=(w*${x})-text_w/2:y=(h*${y})-text_h/2:fontsize=${size}:fontcolor=white:borderw=3:bordercolor=black`
+  }).filter(Boolean).join(',')
 }
 
 async function prepareUnlocked(opts: {
@@ -103,14 +122,26 @@ async function prepareUnlocked(opts: {
   dataDir: string
   ffmpegPath: string
   maxVideoSeconds: number
+  trimStart?: number
+  trimEnd?: number
+  mute?: boolean
+  overlays?: MediaOverlay[]
+  fontFile?: string
 }): Promise<PreparedMedia> {
+  const fontFile = opts.fontFile || process.env.DRAWTEXT_FONT || '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+  const overlays = (opts.overlays ?? []).filter((item) => item.text.trim())
+  if (overlays.length > 0 && !fs.existsSync(fontFile)) {
+    throw new Error('Не найден шрифт для текста на статусе. В образе Docker он ставится вместе с ffmpeg.')
+  }
+  const paint = overlayFilter(overlays, fontFile)
   const dir = path.join(opts.dataDir, 'media')
   fs.mkdirSync(dir, { recursive: true })
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`
   if (opts.kind === 'image') {
     const output = path.join(dir, `${id}.jpg`)
     const thumb = path.join(dir, `${id}-thumb.jpg`)
-    await runFfmpeg(opts.ffmpegPath, ['-y', '-i', opts.sourcePath, '-frames:v', '1', '-update', '1', '-vf', BOX, '-q:v', '3', output], output)
+    const imageFilter = [BOX, paint].filter(Boolean).join(',')
+    await runFfmpeg(opts.ffmpegPath, ['-y', '-i', opts.sourcePath, '-frames:v', '1', '-update', '1', '-vf', imageFilter, '-q:v', '3', output], output)
     await runFfmpeg(opts.ffmpegPath, ['-y', '-i', output, '-frames:v', '1', '-update', '1', '-vf', 'scale=320:-2', '-q:v', '6', thumb], thumb)
     const facts = await probeVideo(opts.ffmpegPath, output)
     return { path: output, thumbPath: thumb, width: facts?.width ?? 0, height: facts?.height ?? 0, skippedTranscode: false }
@@ -118,20 +149,25 @@ async function prepareUnlocked(opts: {
 
   const facts = await probeVideo(opts.ffmpegPath, opts.sourcePath)
   const thumb = path.join(dir, `${id}-thumb.jpg`)
-  if (facts && !videoNeedsTranscode(facts, opts.maxVideoSeconds)) {
+  const trimStart = Math.max(0, opts.trimStart ?? 0)
+  const trimEnd = opts.trimEnd && opts.trimEnd > trimStart ? opts.trimEnd : trimStart + opts.maxVideoSeconds
+  const duration = Math.min(opts.maxVideoSeconds, Math.max(0.2, trimEnd - trimStart))
+  const edited = trimStart > 0.05 || Boolean(opts.mute) || paint.length > 0 || (facts != null && duration + 0.2 < facts.duration)
+  if (facts && !edited && !videoNeedsTranscode(facts, opts.maxVideoSeconds)) {
     const output = path.join(dir, `${id}.mp4`)
     await fs.promises.copyFile(opts.sourcePath, output)
     await runFfmpeg(opts.ffmpegPath, ['-y', '-i', output, '-frames:v', '1', '-update', '1', '-vf', 'scale=320:-2', '-q:v', '6', thumb], thumb)
     return { path: output, thumbPath: thumb, width: facts.width, height: facts.height, skippedTranscode: true }
   }
   const output = path.join(dir, `${id}.mp4`)
+  const videoFilter = [`${BOX},fps=30`, paint].filter(Boolean).join(',')
+  const audioArgs = opts.mute ? ['-an'] : ['-map', '0:a:0?', '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '128k']
   await runFfmpeg(opts.ffmpegPath, [
-    '-y', '-i', opts.sourcePath, '-t', String(opts.maxVideoSeconds),
-    '-map', '0:v:0', '-map', '0:a:0?',
-    '-vf', `${BOX},fps=30`,
+    '-y', ...(trimStart > 0.05 ? ['-ss', String(trimStart)] : []), '-i', opts.sourcePath, '-t', String(duration),
+    '-map', '0:v:0', ...audioArgs,
+    '-vf', videoFilter,
     '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-level', '4.0', '-pix_fmt', 'yuv420p',
     '-b:v', '2500k', '-maxrate', '3000k', '-bufsize', '5000k',
-    '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '128k',
     '-movflags', '+faststart',
     output,
   ], output)

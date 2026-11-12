@@ -12,7 +12,7 @@ import { contactsToCsv, contactsToXlsx } from '../exportContacts.js'
 import { ImportFormatError } from '../errors.js'
 import { buildImportPlan, parseContactFile } from '../importContacts.js'
 import { prepareStatusMedia } from '../media.js'
-import { cooldownRemainingMs } from '../statusLogic.js'
+import { cooldownRemainingMs, parseAudienceSpec } from '../statusLogic.js'
 import { moscowLocalToUtcIso } from '../time.js'
 import type { AudienceSource, PostKind, SourceFilter } from '../types.js'
 import type { WaManager } from '../waManager.js'
@@ -88,7 +88,8 @@ export function createApp(deps: Deps): express.Express {
     guard.succeed(ip)
     const session = issueSession(config.sessionSecret, config.sessionTtlHours * 3600 * 1000)
     res.setHeader('Set-Cookie', sessionCookie(session.token, session.maxAgeSec, config.cookieSecure))
-    res.redirect(safeNext(typeof req.body.next === 'string' ? req.body.next : '/'))
+    const next = safeNext(typeof req.body.next === 'string' ? req.body.next : '/')
+    res.redirect(next === '/' ? '/stories' : next)
   })
 
   app.use((req, res, next) => {
@@ -339,6 +340,127 @@ export function createApp(deps: Deps): express.Express {
     res.json({ waitMs, until: waitMs > 0 ? new Date(now + waitMs).toISOString() : null, running })
   })
 
+  app.post('/api/audience-count', (req, res) => {
+    let spec = parseAudienceSpec({})
+    try {
+      spec = parseAudienceSpec(JSON.parse(typeof req.body.audience === 'string' ? req.body.audience : '{}'))
+    } catch {
+      spec = parseAudienceSpec({})
+    }
+    res.json({ count: db.phonesForSpec(spec).length })
+  })
+
+  app.get('/api/contacts', (req, res) => {
+    const found = db.searchContacts({ q: q(req.query.q), tag: '', source: 'all', limit: 20, offset: 0 })
+    res.json({
+      items: found.items.map((contact) => ({
+        phone: contact.phone,
+        name: contact.name,
+        tags: contact.tags,
+        sources: contact.sources,
+      })),
+    })
+  })
+
+  app.post('/stories/compose', upload.array('files', 20), async (req, res) => {
+    if (!csrfOk(csrf(res), req.body?.csrf)) {
+      res.status(403).json({ error: 'csrf' })
+      return
+    }
+    const files = (req.files ?? []) as Upload[]
+    const cleanup = async () => {
+      await Promise.all(files.map((file) => fs.promises.rm(file.path, { force: true })))
+    }
+    let items: ComposeItem[] = []
+    let audienceRaw: unknown = {}
+    try {
+      items = JSON.parse(typeof req.body.items === 'string' ? req.body.items : '[]') as ComposeItem[]
+      audienceRaw = JSON.parse(typeof req.body.audience === 'string' ? req.body.audience : '{}')
+    } catch {
+      await cleanup()
+      res.status(400).json({ error: 'В форме нет списка статусов' })
+      return
+    }
+    if (!Array.isArray(items) || items.length === 0 || items.length > 20) {
+      await cleanup()
+      res.status(400).json({ error: 'Нужен хотя бы один статус, не больше 20' })
+      return
+    }
+    const account = db.getAccount(typeof req.body.account_id === 'string' ? req.body.account_id : '')
+    if (!account) {
+      await cleanup()
+      res.status(400).json({ error: 'Выберите номер' })
+      return
+    }
+    const spec = parseAudienceSpec(audienceRaw)
+    if (db.phonesForSpec(spec).length === 0) {
+      await cleanup()
+      res.status(400).json({ error: 'В выбранной аудитории нет контактов' })
+      return
+    }
+    const ids: number[] = []
+    try {
+      for (const item of items) {
+        const kind = item.kind === 'image' || item.kind === 'video' ? item.kind : 'text'
+        let mediaPath: string | null = null
+        let thumbPath: string | null = null
+        let mediaWidth: number | null = null
+        let mediaHeight: number | null = null
+        if (kind !== 'text') {
+          const file = files[Number(item.fileIndex)]
+          if (!file) throw new Error('Не хватает файла для одного из статусов')
+          const prepared = await prepareStatusMedia({
+            kind,
+            sourcePath: file.path,
+            dataDir: config.dataDir,
+            ffmpegPath: config.ffmpegPath,
+            maxVideoSeconds: config.maxVideoSeconds,
+            trimStart: numberOr(item.trimStart),
+            trimEnd: numberOr(item.trimEnd),
+            mute: Boolean(item.mute),
+            overlays: Array.isArray(item.overlays) ? item.overlays.flatMap((overlay) => {
+              if (!overlay || typeof overlay.text !== 'string' || !overlay.text.trim()) return []
+              return [{ text: overlay.text, x: Number(overlay.x) || 0.5, y: Number(overlay.y) || 0.5 }]
+            }) : [],
+          })
+          mediaPath = prepared.path
+          thumbPath = prepared.thumbPath
+          mediaWidth = prepared.width || null
+          mediaHeight = prepared.height || null
+        }
+        const text = typeof item.text === 'string' ? item.text.trim().slice(0, 700) : ''
+        if (kind === 'text' && !text) throw new Error('В текстовом статусе нет текста')
+        const post = db.createPost({
+          accountId: account.id,
+          kind,
+          body: kind === 'text' ? text : '',
+          caption: typeof item.caption === 'string' ? item.caption.trim().slice(0, 1024) : '',
+          mediaPath,
+          thumbPath,
+          mediaWidth,
+          mediaHeight,
+          originalName: kind === 'text' ? null : files[Number(item.fileIndex)]?.originalname ?? null,
+          backgroundColor: kind === 'text' ? hexColor(item.color) : null,
+          font: kind === 'text' ? fontOf(item.font) : null,
+          audienceSource: 'any',
+          audienceTag: null,
+          audienceSpec: JSON.stringify(spec),
+          scheduledAt: null,
+          status: 'queued',
+        })
+        ids.push(post.id)
+      }
+    } catch (error) {
+      const now = new Date().toISOString()
+      for (const id of ids) db.requestDelete(id, now)
+      await cleanup()
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Не удалось подготовить статус' })
+      return
+    }
+    await cleanup()
+    res.json({ ids })
+  })
+
   app.get('/api/audience', (req, res) => {
     const source = audienceOf(q(req.query.source))
     const tag = q(req.query.tag).trim()
@@ -361,6 +483,7 @@ export function createApp(deps: Deps): express.Express {
       csrf: csrf(res),
       batchSize: config.batchSize,
       batchDelayMs: config.batchDelayMs,
+      maxVideoSeconds: config.maxVideoSeconds,
       showDeleted,
       failedRevokes: new Map(posts.map((post) => [post.id, db.listBatches(post.id).some((batch) => batch.revokeStatus === 'failed')])),
     })))
@@ -677,6 +800,24 @@ export function createApp(deps: Deps): express.Express {
   })
 
   return app
+}
+
+type ComposeItem = {
+  kind?: string
+  text?: string
+  caption?: string
+  color?: string
+  font?: number
+  fileIndex?: number
+  trimStart?: number
+  trimEnd?: number
+  mute?: boolean
+  overlays?: { text?: string; x?: number; y?: number }[]
+}
+
+function numberOr(value: unknown): number | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 function sendPostFile(dataDir: string, db: AppDb, id: number, kind: 'media' | 'thumb', res: Response): void {

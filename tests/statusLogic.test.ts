@@ -4,7 +4,10 @@ import test from 'node:test'
 import { openDatabase } from '../src/db.js'
 import {
   cooldownRemainingMs,
+  escapeDrawtext,
+  matchAudience,
   normalizeOwnJid,
+  planVideoSegments,
   statusDeleteKey,
   videoNeedsTranscode,
   viewFromReceipt,
@@ -46,6 +49,23 @@ test('просмотр считается только по квитанции r
   assert.equal(viewFromReceipt({ remoteJid: 'status@broadcast', messageId: 'abc', userJid: '79280000001@s.whatsapp.net' }), null)
 })
 
+test('аудитория как в WhatsApp и нарезка длинного видео', () => {
+  const contacts = [
+    { phone: '79280000001', tags: ['vip'], sources: ['phone'] as Array<'whatsapp' | 'phone'> },
+    { phone: '79280000002', tags: ['город'], sources: ['whatsapp'] as Array<'whatsapp' | 'phone'> },
+    { phone: '79280000003', tags: ['vip'], sources: ['whatsapp', 'phone'] as Array<'whatsapp' | 'phone'> },
+  ]
+  const all = contacts.filter((contact) => matchAudience(contact, { mode: 'all', excludeTags: [], excludePhones: [], includeTags: [], includeSources: [], includePhones: [] }))
+  assert.equal(all.length, 3)
+  const except = contacts.filter((contact) => matchAudience(contact, { mode: 'exclude', excludeTags: ['vip'], excludePhones: [], includeTags: [], includeSources: [], includePhones: [] }))
+  assert.deepEqual(except.map((contact) => contact.phone), ['79280000002'])
+  const only = contacts.filter((contact) => matchAudience(contact, { mode: 'only', excludeTags: [], excludePhones: [], includeTags: [], includeSources: ['whatsapp'], includePhones: ['79280000001'] }))
+  assert.deepEqual(only.map((contact) => contact.phone), ['79280000001', '79280000002', '79280000003'])
+  assert.deepEqual(planVideoSegments(75, 30).map((part) => part.end), [30, 60, 75])
+  assert.equal(planVideoSegments(12, 30).length, 1)
+  assert.equal(escapeDrawtext("10:00 it's 100%"), "10\\:00 it\\'s 100\\%")
+})
+
 test('удаление прячет статус, сохраняет просмотры и помечает пачки к отзыву', () => {
   const db = openDatabase(':memory:')
   const account = db.createAccount('Тест')
@@ -66,6 +86,21 @@ test('удаление прячет статус, сохраняет просм�
   assert.equal(db.retryRevoke(post.id), true)
   assert.equal(db.pendingRevokes(post.id).length, 1)
   assert.deepEqual(statusDeleteKey('MSG9'), { remoteJid: 'status@broadcast', fromMe: true, id: 'MSG9' })
+  db.close()
+})
+
+test('спецификация аудитории выбирает телефоны из базы', () => {
+  const db = openDatabase(':memory:')
+  db.applyMerge([
+    { phone: '79280000001', name: 'Аминат', nameRank: 3, tags: ['vip'], sources: ['phone'] },
+    { phone: '79280000002', name: 'Ислам', nameRank: 3, tags: ['город'], sources: ['whatsapp'] },
+  ])
+  const all = db.phonesForSpec({ mode: 'all', excludeTags: [], excludePhones: [], includeTags: [], includeSources: [], includePhones: [] })
+  assert.deepEqual(all, ['79280000001', '79280000002'])
+  const only = db.phonesForSpec({ mode: 'only', excludeTags: [], excludePhones: [], includeTags: ['vip'], includeSources: [], includePhones: [] })
+  assert.deepEqual(only, ['79280000001'])
+  const except = db.phonesForSpec({ mode: 'exclude', excludeTags: [], excludePhones: ['79280000001'], includeTags: [], includeSources: [], includePhones: [] })
+  assert.deepEqual(except, ['79280000002'])
   db.close()
 })
 

@@ -198,62 +198,145 @@ const card = document.querySelector('#story-card')
 if (storyDataNode && stage instanceof HTMLElement && card instanceof HTMLElement) {
   const stories = JSON.parse(storyDataNode.textContent || '[]')
   const byId = new Map(stories.map((story) => [String(story.id), story]))
-  const close = () => { stage.hidden = true; stage.classList.add('hidden'); card.innerHTML = '' }
-  const open = (id) => {
+  const order = stories.filter((story) => !story.deleted).map((story) => String(story.id))
+  let cursor = 0
+  let timer = 0
+  let holding = false
+  const close = () => {
+    window.clearTimeout(timer)
+    stage.hidden = true
+    stage.classList.add('hidden')
+    card.innerHTML = ''
+  }
+  const go = (step) => {
+    const next = cursor + step
+    if (next < 0 || next >= order.length) { close(); return }
+    cursor = next
+    render(order[cursor])
+  }
+  const render = (id) => {
+    window.clearTimeout(timer)
     const story = byId.get(String(id))
     if (!story) return
+    cursor = Math.max(0, order.indexOf(String(id)))
     card.innerHTML = ''
     card.style.background = story.color || '#0b141a'
+    const bars = document.createElement('div')
+    bars.className = 'story-bars'
+    order.forEach((storyId, barIndex) => {
+      const bar = document.createElement('span')
+      const fill = document.createElement('i')
+      if (barIndex < cursor) fill.style.width = '100%'
+      if (barIndex === cursor) fill.dataset.current = '1'
+      bar.append(fill)
+      bars.append(bar)
+    })
+    card.append(bars)
     if (story.kind === 'text') {
-      const text = document.createElement('div')
-      text.className = 'story-text'
-      text.textContent = story.text
-      card.append(text)
+      const node = document.createElement('div')
+      node.className = 'story-text'
+      node.textContent = story.text
+      card.append(node)
+      schedule(5000)
     } else if (story.mediaUrl) {
       const media = document.createElement(story.kind === 'video' ? 'video' : 'img')
       media.className = 'story-media'
       media.src = story.mediaUrl
-      if (media instanceof HTMLVideoElement) { media.controls = true; media.autoplay = true; media.playsInline = true }
+      if (media instanceof HTMLVideoElement) {
+        media.autoplay = true
+        media.playsInline = true
+        media.onended = () => go(1)
+      } else schedule(5000)
       card.append(media)
     }
+    const leftHit = document.createElement('div')
+    leftHit.className = 'story-hit'
+    const rightHit = document.createElement('div')
+    rightHit.className = 'story-hit right'
+    leftHit.addEventListener('click', (event) => { event.stopPropagation(); go(-1) })
+    rightHit.addEventListener('click', (event) => { event.stopPropagation(); go(1) })
+    const menu = document.createElement('button')
+    menu.type = 'button'
+    menu.className = 'story-menu'
+    menu.textContent = '⋮'
+    menu.addEventListener('click', (event) => {
+      event.stopPropagation()
+      if (window.confirm('Удалить этот статус у всех в WhatsApp? Это нельзя отменить.')) {
+        document.getElementById('delete-story-' + story.id)?.requestSubmit()
+      }
+    })
     const copy = document.createElement('div')
     copy.className = 'story-copy'
-    const title = document.createElement('h3')
-    title.textContent = story.label
-    const meta = document.createElement('p')
-    const expires = story.expires ? Date.parse(story.expires) : 0
-    const left = expires ? Math.max(0, expires - Date.now()) : 0
-    const hours = Math.floor(left / 3600000)
-    const minutes = Math.floor((left % 3600000) / 60000)
-    meta.textContent = story.deleted
-      ? `${story.posted}. Удалён. 👁 ${story.views}`
-      : `${story.posted}. ${left > 0 ? `Исчезнет через ${hours} ч ${minutes} мин` : '24 часа прошли'}. 👁 ${story.views}`
-    const link = document.createElement('a')
-    link.href = `/status/${story.id}/viewers`
-    link.textContent = 'Кто смотрел'
-    link.style.color = 'white'
-    const remove = document.createElement('button')
-    remove.type = 'button'
-    remove.className = 'danger'
-    remove.textContent = 'Удалить'
-    remove.addEventListener('click', () => {
-      document.getElementById(`delete-story-${story.id}`)?.requestSubmit()
-    })
-    copy.append(title, meta, link)
-    if (!story.deleted) copy.append(remove)
+    const eye = document.createElement('button')
+    eye.type = 'button'
+    eye.textContent = '👁 ' + story.views
+    eye.addEventListener('click', () => { window.location.href = '/status/' + story.id + '/viewers' })
+    copy.append(eye)
     if (story.caption) {
       const caption = document.createElement('p')
       caption.textContent = story.caption
       copy.append(caption)
     }
-    card.append(copy)
+    card.append(leftHit, rightHit, menu, copy)
+    let startY = 0
+    card.onpointerdown = (event) => {
+      if (event.target === menu || event.target === eye) return
+      holding = true
+      startY = event.clientY
+      window.clearTimeout(timer)
+      const video = card.querySelector('video')
+      if (video instanceof HTMLVideoElement) video.pause()
+    }
+    card.onpointerup = (event) => {
+      if (startY - event.clientY > 60) window.location.href = '/status/' + story.id + '/viewers'
+      holding = false
+      const video = card.querySelector('video')
+      if (video instanceof HTMLVideoElement) void video.play()
+    }
     stage.hidden = false
     stage.classList.remove('hidden')
   }
+  function schedule(ms) {
+    let elapsed = 0
+    let last = Date.now()
+    const tick = () => {
+      const now = Date.now()
+      if (!holding) elapsed += now - last
+      last = now
+      const node = card.querySelector('[data-current]')
+      const ratio = Math.min(1, elapsed / ms)
+      if (node instanceof HTMLElement) node.style.width = (ratio * 100) + '%'
+      if (ratio >= 1) go(1)
+      else timer = window.setTimeout(tick, 80)
+    }
+    timer = window.setTimeout(tick, 80)
+  }
   document.querySelectorAll('[data-open-story]').forEach((node) => {
-    node.addEventListener('click', () => open(node.getAttribute('data-open-story')))
+    node.addEventListener('click', () => render(node.getAttribute('data-open-story')))
   })
+  const paintRings = async () => {
+    const rings = [...document.querySelectorAll('[data-status="queued"], [data-status="running"]')]
+    let reload = false
+    for (const ring of rings) {
+      const face = ring.querySelector('.ring-face')
+      const response = await fetch(ring.getAttribute('data-progress') || '', { cache: 'no-store' })
+      if (!response.ok) continue
+      const data = await response.json()
+      if (face instanceof HTMLElement) {
+        face.classList.add('progress')
+        face.style.setProperty('--p', `${data.percent || 8}%`)
+      }
+      if (data.finished) reload = true
+    }
+    if (reload) window.location.reload()
+    else if (rings.length > 0) window.setTimeout(() => { void paintRings() }, 1500)
+  }
+  void paintRings()
   document.querySelector('#story-close')?.addEventListener('click', close)
-  stage.addEventListener('click', (event) => { if (event.target === stage) close() })
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') close() })
+  document.addEventListener('keydown', (event) => {
+    if (stage.hidden) return
+    if (event.key === 'Escape') close()
+    if (event.key === 'ArrowRight') go(1)
+    if (event.key === 'ArrowLeft') go(-1)
+  })
 }

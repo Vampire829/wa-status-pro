@@ -72,6 +72,7 @@ test('панель отдаёт вход на русском и не пуска�
     })
     const cookie = ok.headers.get('set-cookie') ?? ''
     assert.match(cookie, /wsp_session=/)
+    assert.equal(ok.headers.get('location'), '/stories')
     const home = await fetch(`http://127.0.0.1:${port}/`, { headers: { cookie: cookie.split(';')[0] ?? '' } })
     const homeHtml = await home.text()
     assert.match(homeHtml, /Обзор/)
@@ -80,6 +81,39 @@ test('панель отдаёт вход на русском и не пуска�
     const healthHtml = await journal.text()
     assert.match(healthHtml, /Прокси WhatsApp не задан/)
     assert.match(healthHtml, /Проверить прокси/)
+    db.applyMerge([{ phone: '79280000001', name: 'Аминат', nameRank: 3, tags: ['vip'], sources: ['phone'] }])
+    const account = db.createAccount('Тест')
+    const stories = await fetch(`http://127.0.0.1:${port}/stories`, { headers: { cookie: cookie.split(';')[0] ?? '' } })
+    const storiesHtml = await stories.text()
+    assert.match(storiesHtml, /id="add-status"/)
+    assert.match(storiesHtml, /Статус/)
+    assert.match(storiesHtml, /id="add-text"/)
+    assert.match(storiesHtml, /composer\.js/)
+    const csrf = /data-csrf="([^"]+)"/.exec(storiesHtml)?.[1] ?? ''
+    assert.ok(csrf)
+    const count = await fetch(`http://127.0.0.1:${port}/api/audience-count`, {
+      method: 'POST',
+      headers: { cookie: cookie.split(';')[0] ?? '', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf, audience: JSON.stringify({ mode: 'only', includeTags: ['vip'] }) }),
+    })
+    assert.equal((await count.json()).count, 1)
+    const form = new FormData()
+    form.set('csrf', csrf)
+    form.set('account_id', account.id)
+    form.set('audience', JSON.stringify({ mode: 'only', includeTags: ['vip'], includeSources: [], includePhones: [], excludeTags: [], excludePhones: [] }))
+    form.set('items', JSON.stringify([{ kind: 'text', text: 'Салам', color: '#0e6b52', font: 1 }]))
+    const sent = await fetch(`http://127.0.0.1:${port}/stories/compose`, {
+      method: 'POST',
+      headers: { cookie: cookie.split(';')[0] ?? '' },
+      body: form,
+    })
+    const body = await sent.json() as { ids?: number[]; error?: string }
+    assert.equal(sent.status, 200, body.error)
+    const created = db.getPost(body.ids?.[0] ?? 0)
+    assert.equal(created?.body, 'Салам')
+    assert.equal(created?.font, 1)
+    assert.equal(created?.status, 'queued')
+    assert.match(created?.audienceSpec ?? '', /"mode":"only"/)
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
     db.close()

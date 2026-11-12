@@ -4,7 +4,7 @@ import { planBatches } from './batch.js'
 import type { AppDb } from './db.js'
 import { WaSendError } from './errors.js'
 import { readJpegThumbnail } from './media.js'
-import { audienceCount, cooldownRemainingMs, withOwnJid } from './statusLogic.js'
+import { audienceCount, cooldownRemainingMs, parseAudienceSpec, withOwnJid } from './statusLogic.js'
 import type { StatusPost } from './types.js'
 import { nowIso } from './time.js'
 import type { StatusContent, WaManager } from './waManager.js'
@@ -93,7 +93,9 @@ async function runPost(deps: PublisherDeps, post: StatusPost, now: Date): Promis
       requeue(deps, post.id, 20_000, 'Номер не на связи, публикация ждёт подключения')
       return
     }
-    const phones = deps.db.audiencePhones(post.audienceSource, post.audienceTag)
+    const phones = post.audienceSpec
+      ? deps.db.phonesForSpec(parseAudienceSpec(JSON.parse(post.audienceSpec) as unknown))
+      : deps.db.audiencePhones(post.audienceSource, post.audienceTag)
     const jids = phones.map((phone) => `${phone}@s.whatsapp.net`)
     const own = deps.wa.ownJid(post.accountId)
     const chunks = withOwnJid(planBatches(jids, deps.batchSize), own)
